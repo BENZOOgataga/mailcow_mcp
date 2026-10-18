@@ -303,193 +303,6 @@ async function main() {
     check('authorization code is present', !!code);
     check('state is echoed back', location.searchParams.get('state') === 'xyz');
 
-    // --- consent throttling --------------------------------------------------
-    //
-    // This section exists because the throttle here was wrong three times, and
-    // each assertion below pins one of those.
-    //
-    // It was keyed on a hash of the consent page, so one caller could not slow
-    // another. An attacker resets that for free: /authorize needs no
-    // authentication and registration is open, so a fresh page before each
-    // guess makes every guess the first failure for its own key.
-    //
-    // The saturation guard then ran before the password was checked, so a
-    // flood of failures had the operator's own correct submission answered
-    // with a 503.
-    //
-    // And the delay was applied to the *reply* rather than to the *check*,
-    // which bounded latency and not guessing: saturate the route and every
-    // guess was still evaluated at full speed, a wrong one dropped at once and
-    // a right one redirected at once. That is a negative oracle, and it is why
-    // a correct password now waits its turn like everything else.
-    let sawTooManyRequests = false;
-
-    async function consentAttempt(password) {
-      // A fresh consent page every time, which is exactly what an attacker does.
-      const blob = await newGrantBlob(client.client_id);
-      const started = Date.now();
-      const attempt = await fetch(`${BASE}/authorize/consent`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ pending: blob, password }),
-        redirect: 'manual',
-      });
-      if (attempt.status === 429) sawTooManyRequests = true;
-      return { status: attempt.status, elapsed: Date.now() - started };
-    }
-
-    const firstFailure = await consentAttempt('wrong-one');
-    check('a wrong password is rejected', firstFailure.status === 401, `status ${firstFailure.status}`);
-
-    // Overflow past the queue bound must be refused WITHOUT a verdict.
-    //
-    // The version this replaces checked a submission immediately once the
-    // queue had grown past a time ceiling, which reads like graceful
-    // degradation and was a total bypass: a skipping submission never advances
-    // the cursor, so after one flood pushed it past the ceiling, every later
-    // guess was checked at once with no spacing at all. The bound it was meant
-    // to soften stopped existing.
-    //
-    // What should happen instead: the submissions that fit the queue wait
-    // their turn, and the rest get a 503 decided on depth alone, before the
-    // password is read. So within a few hundred milliseconds the only
-    // responses seen should be refusals, never a 401 or a 302, because
-    // answering either of those quickly is the verdict leaking.
-    const overflowControllers = [];
-    const overflowStatuses = [];
-    for (let i = 0; i < 14; i++) {
-      const blob = await newGrantBlob(client.client_id);
-      const controller = new AbortController();
-      overflowControllers.push(controller);
-      void fetch(`${BASE}/authorize/consent`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ pending: blob, password: `overflow-${i}` }),
-        redirect: 'manual',
-        signal: controller.signal,
-      })
-        .then((r) => overflowStatuses.push(r.status))
-        .catch(() => {});
-    }
-    await new Promise((r) => setTimeout(r, 700));
-
-    const fastVerdicts = overflowStatuses.filter((s) => s === 401 || s === 302);
-    check(
-      'overflow submissions are refused rather than checked',
-      overflowStatuses.includes(503),
-      `statuses seen within 700ms: ${overflowStatuses.join(',') || '(none)'}`,
-    );
-    check(
-      'no submission is given a verdict ahead of its slot',
-      fastVerdicts.length === 0,
-      `${fastVerdicts.length} verdict(s) returned early: ${fastVerdicts.join(',')}`,
-    );
-
-    // Release the queued ones so the rest of the suite is not waiting behind
-    // them; the slots are handed back on disconnect.
-    for (const controller of overflowControllers) controller.abort();
-    await new Promise((r) => setTimeout(r, 400));
-
-    // Repeated cycles of abandoned submissions must not grow the wait.
-    //
-    // Each admitted submission advances the check cursor, and the rollback on
-    // disconnect only covers the most recent reservation. So an attacker who
-    // keeps the queue cycling and abandons the oldest entries used to push the
-    // cursor forward without limit. That never refuses the operator, which the
-    // rest of this design is careful about, and makes them wait an unbounded
-    // time instead, which is the same outcome by a slower route. The cursor is
-    // clamped now.
-    for (let round = 0; round < 3; round++) {
-      const cycle = [];
-      for (let i = 0; i < 8; i++) {
-        const blob = await newGrantBlob(client.client_id);
-        const controller = new AbortController();
-        cycle.push(
-          fetch(`${BASE}/authorize/consent`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({ pending: blob, password: `cycle-${round}-${i}` }),
-            redirect: 'manual',
-            signal: controller.signal,
-          }).catch(() => null),
-        );
-        setTimeout(() => controller.abort(), 40);
-      }
-      await Promise.allSettled(cycle);
-    }
-
-    const boundedBlob = await newGrantBlob(client.client_id);
-    const boundedStarted = Date.now();
-    const bounded = await fetch(`${BASE}/authorize/consent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ pending: boundedBlob, password: 'still-wrong' }),
-      redirect: 'manual',
-    });
-    const boundedElapsed = Date.now() - boundedStarted;
-    check(
-      'a submission is still answered after repeated abandoned cycles',
-      bounded.status === 401 || bounded.status === 503,
-      `status ${bounded.status}`,
-    );
-    check(
-      'and the wait is bounded rather than inflated by them',
-      boundedElapsed < 25000,
-      `waited ${boundedElapsed}ms, which means the cursor was pushed forward without limit`,
-    );
-
-    // The guarantee is a bound on how often a guess is *checked*, server-wide,
-    // whatever concurrency the attacker brings. Four guesses fired at once,
-    // each with its own freshly rendered consent page, must therefore take
-    // several seconds in total rather than finishing together: they are
-    // serialized behind the check slot, and a fresh page does not buy a caller
-    // a slot of its own.
-    const burstStarted = Date.now();
-    const burst = await Promise.all([
-      consentAttempt('burst-one'),
-      consentAttempt('burst-two'),
-      consentAttempt('burst-three'),
-      consentAttempt('burst-four'),
-    ]);
-    const burstElapsed = Date.now() - burstStarted;
-
-    check(
-      'concurrent guesses are all rejected',
-      burst.every((attempt) => attempt.status === 401),
-      burst.map((a) => a.status).join(','),
-    );
-    check(
-      'concurrent guesses are checked one at a time, not all at once',
-      burstElapsed > 2500,
-      `four concurrent guesses resolved in ${burstElapsed}ms, which would mean the check rate is unbounded`,
-    );
-
-    // The one that catches the oracle: after failures have accumulated, a
-    // correct password must wait for its slot too. If it comes back promptly
-    // while wrong answers are being throttled, the response time is the
-    // verdict and the throttle is decorative.
-    const throttledSuccess = await consentAttempt(PASSWORD);
-    check(
-      'a correct password is accepted',
-      throttledSuccess.status === 302,
-      `status ${throttledSuccess.status}`,
-    );
-    check(
-      'a correct password does not skip the check queue',
-      throttledSuccess.elapsed > 1500,
-      `${throttledSuccess.elapsed}ms, which would make response time the verdict`,
-    );
-    check('no submission is ever answered with 429', !sawTooManyRequests);
-
-    // That success cleared the counter, so the flows below are not throttled.
-    // Only a correct password clears it; guessing cannot.
-    const afterSuccess = await consentAttempt(PASSWORD);
-    check(
-      'a correct password is prompt once the counter is cleared',
-      afterSuccess.status === 302 && afterSuccess.elapsed < 1000,
-      `status ${afterSuccess.status} in ${afterSuccess.elapsed}ms`,
-    );
-
     // --- PKCE is actually enforced ---------------------------------------
     const wrongVerifier = await fetch(`${BASE}/token`, {
       method: 'POST',
@@ -913,6 +726,193 @@ async function main() {
     const tooBigText = await tooBig.text();
     check('an oversized body is rejected', tooBig.status >= 400 && tooBig.status < 500, `status ${tooBig.status}`);
     check('an oversized body leaks no stack trace', !looksLikeAStackTrace(tooBigText), tooBigText.slice(0, 300));
+
+    // --- consent throttling --------------------------------------------------
+    //
+    // This section exists because the throttle here was wrong three times, and
+    // each assertion below pins one of those.
+    //
+    // It was keyed on a hash of the consent page, so one caller could not slow
+    // another. An attacker resets that for free: /authorize needs no
+    // authentication and registration is open, so a fresh page before each
+    // guess makes every guess the first failure for its own key.
+    //
+    // The saturation guard then ran before the password was checked, so a
+    // flood of failures had the operator's own correct submission answered
+    // with a 503.
+    //
+    // And the delay was applied to the *reply* rather than to the *check*,
+    // which bounded latency and not guessing: saturate the route and every
+    // guess was still evaluated at full speed, a wrong one dropped at once and
+    // a right one redirected at once. That is a negative oracle, and it is why
+    // a correct password now waits its turn like everything else.
+    let sawTooManyRequests = false;
+
+    async function consentAttempt(password) {
+      // A fresh consent page every time, which is exactly what an attacker does.
+      const blob = await newGrantBlob(client.client_id);
+      const started = Date.now();
+      const attempt = await fetch(`${BASE}/authorize/consent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ pending: blob, password }),
+        redirect: 'manual',
+      });
+      if (attempt.status === 429) sawTooManyRequests = true;
+      return { status: attempt.status, elapsed: Date.now() - started };
+    }
+
+    const firstFailure = await consentAttempt('wrong-one');
+    check('a wrong password is rejected', firstFailure.status === 401, `status ${firstFailure.status}`);
+
+    // Overflow past the queue bound must be refused WITHOUT a verdict.
+    //
+    // The version this replaces checked a submission immediately once the
+    // queue had grown past a time ceiling, which reads like graceful
+    // degradation and was a total bypass: a skipping submission never advances
+    // the cursor, so after one flood pushed it past the ceiling, every later
+    // guess was checked at once with no spacing at all. The bound it was meant
+    // to soften stopped existing.
+    //
+    // What should happen instead: the submissions that fit the queue wait
+    // their turn, and the rest get a 503 decided on depth alone, before the
+    // password is read. So within a few hundred milliseconds the only
+    // responses seen should be refusals, never a 401 or a 302, because
+    // answering either of those quickly is the verdict leaking.
+    const overflowControllers = [];
+    const overflowStatuses = [];
+    for (let i = 0; i < 14; i++) {
+      const blob = await newGrantBlob(client.client_id);
+      const controller = new AbortController();
+      overflowControllers.push(controller);
+      void fetch(`${BASE}/authorize/consent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ pending: blob, password: `overflow-${i}` }),
+        redirect: 'manual',
+        signal: controller.signal,
+      })
+        .then((r) => overflowStatuses.push(r.status))
+        .catch(() => {});
+    }
+    await new Promise((r) => setTimeout(r, 700));
+
+    const fastVerdicts = overflowStatuses.filter((s) => s === 401 || s === 302);
+    check(
+      'overflow submissions are refused rather than checked',
+      overflowStatuses.includes(503),
+      `statuses seen within 700ms: ${overflowStatuses.join(',') || '(none)'}`,
+    );
+    check(
+      'no submission is given a verdict ahead of its slot',
+      fastVerdicts.length === 0,
+      `${fastVerdicts.length} verdict(s) returned early: ${fastVerdicts.join(',')}`,
+    );
+
+    // Release the queued ones so the rest of the suite is not waiting behind
+    // them; the slots are handed back on disconnect.
+    for (const controller of overflowControllers) controller.abort();
+    await new Promise((r) => setTimeout(r, 400));
+
+    // Repeated cycles of abandoned submissions must not grow the wait.
+    //
+    // Each admitted submission advances the check cursor, and the rollback on
+    // disconnect only covers the most recent reservation. So an attacker who
+    // keeps the queue cycling and abandons the oldest entries used to push the
+    // cursor forward without limit. That never refuses the operator, which the
+    // rest of this design is careful about, and makes them wait an unbounded
+    // time instead, which is the same outcome by a slower route. The cursor is
+    // clamped now.
+    for (let round = 0; round < 3; round++) {
+      const cycle = [];
+      for (let i = 0; i < 8; i++) {
+        const blob = await newGrantBlob(client.client_id);
+        const controller = new AbortController();
+        cycle.push(
+          fetch(`${BASE}/authorize/consent`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ pending: blob, password: `cycle-${round}-${i}` }),
+            redirect: 'manual',
+            signal: controller.signal,
+          }).catch(() => null),
+        );
+        setTimeout(() => controller.abort(), 40);
+      }
+      await Promise.allSettled(cycle);
+    }
+
+    const boundedBlob = await newGrantBlob(client.client_id);
+    const boundedStarted = Date.now();
+    const bounded = await fetch(`${BASE}/authorize/consent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ pending: boundedBlob, password: 'still-wrong' }),
+      redirect: 'manual',
+    });
+    const boundedElapsed = Date.now() - boundedStarted;
+    check(
+      'a submission is still answered after repeated abandoned cycles',
+      bounded.status === 401 || bounded.status === 503,
+      `status ${bounded.status}`,
+    );
+    check(
+      'and the wait is bounded rather than inflated by them',
+      boundedElapsed < 25000,
+      `waited ${boundedElapsed}ms, which means the cursor was pushed forward without limit`,
+    );
+
+    // The guarantee is a bound on how often a guess is *checked*, server-wide,
+    // whatever concurrency the attacker brings. Four guesses fired at once,
+    // each with its own freshly rendered consent page, must therefore take
+    // several seconds in total rather than finishing together: they are
+    // serialized behind the check slot, and a fresh page does not buy a caller
+    // a slot of its own.
+    const burstStarted = Date.now();
+    const burst = await Promise.all([
+      consentAttempt('burst-one'),
+      consentAttempt('burst-two'),
+      consentAttempt('burst-three'),
+      consentAttempt('burst-four'),
+    ]);
+    const burstElapsed = Date.now() - burstStarted;
+
+    check(
+      'concurrent guesses are all rejected',
+      burst.every((attempt) => attempt.status === 401),
+      burst.map((a) => a.status).join(','),
+    );
+    check(
+      'concurrent guesses are checked one at a time, not all at once',
+      burstElapsed > 2500,
+      `four concurrent guesses resolved in ${burstElapsed}ms, which would mean the check rate is unbounded`,
+    );
+
+    // The one that catches the oracle: after failures have accumulated, a
+    // correct password must wait for its slot too. If it comes back promptly
+    // while wrong answers are being throttled, the response time is the
+    // verdict and the throttle is decorative.
+    const throttledSuccess = await consentAttempt(PASSWORD);
+    check(
+      'a correct password is accepted',
+      throttledSuccess.status === 302,
+      `status ${throttledSuccess.status}`,
+    );
+    check(
+      'a correct password does not skip the check queue',
+      throttledSuccess.elapsed > 1500,
+      `${throttledSuccess.elapsed}ms, which would make response time the verdict`,
+    );
+    check('no submission is ever answered with 429', !sawTooManyRequests);
+
+    // That success cleared the counter, so the flows below are not throttled.
+    // Only a correct password clears it; guessing cannot.
+    const afterSuccess = await consentAttempt(PASSWORD);
+    check(
+      'a correct password is prompt once the counter is cleared',
+      afterSuccess.status === 302 && afterSuccess.elapsed < 1000,
+      `status ${afterSuccess.status} in ${afterSuccess.elapsed}ms`,
+    );
 
     // --- unknown routes -------------------------------------------------------
     const notFound = await fetch(`${BASE}/../etc/passwd`);

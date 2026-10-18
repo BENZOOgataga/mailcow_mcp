@@ -107,24 +107,7 @@ const CONSENT_FAILURE_WINDOW_MS = 15 * 60 * 1000;
  * all. It removed the bound it was meant to soften.
  */
 const CONSENT_MAX_QUEUE = 8;
-/**
- * How far ahead of now the check cursor may ever sit.
- *
- * Without this the cursor runs away. Each admitted submission advances it, and
- * the rollback on disconnect only applies to the most recent reservation, so an
- * attacker who keeps the queue cycling and abandons the *oldest* entries pushes
- * it forward indefinitely. The operator is then not refused, which the rest of
- * this design is careful about, but waits an unbounded time, which is the same
- * outcome by a slower route.
- *
- * At the cap, submissions that would have been spaced can coincide, so up to
- * CONSENT_MAX_QUEUE checks may land in one interval instead of one. That is
- * still a bound (at most eight checks per interval, and each one costs the
- * attacker a held connection), unlike the time-ceiling escape hatch this
- * replaced, where skipping submissions stopped advancing the cursor at all and
- * guessing became free.
- */
-const CONSENT_MAX_AHEAD_MS = 20_000;
+
 
 /** Idle MCP sessions are closed after this long without a request. */
 const SESSION_IDLE_MS = 30 * 60 * 1000;
@@ -197,15 +180,29 @@ export class HttpTransportHost {
 
   private consentFailures = 0;
   private consentWindowStartedAt = 0;
-  /** Earliest time the next password check may run. */
-  private consentNextSlotAt = 0;
-  /** Counter identifying the most recent slot reservation. */
-  private consentReservationSeq = 0;
   /** Submissions waiting for, or holding, the check slot. */
   private consentQueueDepth = 0;
-  /** Timers for submissions waiting on a slot, so shutdown can settle them. */
+  /**
+   * Tail of the chain that serialises password checks.
+   *
+   * Deliberately a promise chain and not a timestamp cursor. Four versions of
+   * this used clock arithmetic and three of them were wrong in ways that took
+   * a reviewer to see: a wait ceiling that let submissions skip the queue
+   * without advancing the cursor (so one flood made every later guess free), a
+   * rollback that only covered the newest reservation (so abandoning the
+   * oldest pushed the cursor forward without limit), and then a clamp on how
+   * far ahead the cursor could sit (which made clamped slots land on top of
+   * each other, so checks that should have been spaced coincided).
+   *
+   * A chain has no absolute time in it to inflate or clamp. Each submission
+   * waits for everything ahead of it, runs its check, and then holds the chain
+   * open for one interval so the next check is spaced. Exactly one check per
+   * interval, and nothing to get arithmetically wrong.
+   */
+  private consentChain: Promise<void> = Promise.resolve();
+  /** Links held open on the chain, so shutdown can settle them. */
   private readonly pendingConsentWaits = new Set<{
-    timer: NodeJS.Timeout;
+    timer: NodeJS.Timeout | undefined;
     settle: () => void;
   }>();
   private sessionSweeper?: NodeJS.Timeout;
@@ -432,9 +429,13 @@ export class HttpTransportHost {
 
     if (redirectTo) {
       // Only a correct password clears the throttle, and guessing cannot
-      // produce one.
+      // produce one. Releasing the links already held matters as much as
+      // zeroing the count: an interval is fixed when its link is scheduled, so
+      // without this the operator still queues behind thirty-second holds
+      // reserved by a guessing run that has just been proven irrelevant.
       this.consentFailures = 0;
-      this.consentNextSlotAt = 0;
+      for (const waiting of [...this.pendingConsentWaits]) waiting.settle();
+      this.pendingConsentWaits.clear();
       logger.info('Authorization granted', { ip: req.ip });
       if (!res.headersSent) res.redirect(302, redirectTo);
       return;
@@ -455,87 +456,82 @@ export class HttpTransportHost {
   /**
    * Wait until this submission's turn to be checked.
    *
-   * Reserves the next slot before waiting, so concurrent submissions queue
-   * behind one another instead of all being checked at once. The spacing comes
-   * from the failure count, which is global for the window because any
-   * per-caller key is resettable: `/authorize` is unauthenticated and
-   * registration is open, so a fresh consent page per guess resets anything
-   * keyed to the page.
+   * Returns false if the caller disconnected while waiting, in which case it
+   * gives up its place immediately rather than making the next submission wait
+   * out an interval for a request nobody is listening to. That is what stops a
+   * run of aborted POSTs, which cost an attacker nothing, from delaying the
+   * operator.
    *
-   * Returns false if the caller disconnected while waiting, in which case the
-   * slot is given back.
+   * The spacing comes from the failure count, which is global for the window
+   * because any per-caller key is resettable: `/authorize` is unauthenticated
+   * and registration is open, so a fresh consent page per guess resets
+   * anything keyed to the page.
    */
   private async awaitConsentSlot(req: Request): Promise<boolean> {
     const now = Date.now();
     if (now - this.consentWindowStartedAt > CONSENT_FAILURE_WINDOW_MS) {
       this.consentWindowStartedAt = now;
       this.consentFailures = 0;
-      this.consentNextSlotAt = 0;
     }
 
-    // Clamped, so an abandoned reservation cannot push this out indefinitely.
-    const ceiling = now + CONSENT_MAX_AHEAD_MS;
-    const slot = Math.min(Math.max(now, this.consentNextSlotAt), ceiling);
-    const wait = slot - now;
-
-    // Always reserve, and always wait for the reservation. There is no path
-    // here that checks a password ahead of its slot: that is what makes the
-    // spacing a bound on guessing rather than on latency.
-    this.consentNextSlotAt = Math.min(
-      slot + consentIntervalFor(this.consentFailures + 1),
-      ceiling + CONSENT_MAX_INTERVAL_MS,
-    );
-    const seq = ++this.consentReservationSeq;
-
-    if (wait <= 0) return true;
-
-    return new Promise<boolean>((resolve) => {
-      const entry = {
-        timer: setTimeout(() => {
-          this.pendingConsentWaits.delete(entry);
-          cleanup();
-          resolve(true);
-        }, wait),
-        // Used by stop(), so a shutdown does not block on a sleeping request.
-        settle: (): void => {
-          clearTimeout(entry.timer);
-          this.pendingConsentWaits.delete(entry);
-          cleanup();
-          resolve(false);
-        },
-      };
-      this.pendingConsentWaits.add(entry);
-
-      // A caller that hangs up must not keep its slot. Holding it was what let
-      // an attacker lock the operator out with aborted requests and no open
-      // sockets at all.
-      const onGone = (): void => {
-        clearTimeout(entry.timer);
-        this.pendingConsentWaits.delete(entry);
-        // Hand the slot back when nothing has reserved after it, so a run of
-        // abandoned requests does not push the cursor forward and slow down
-        // whoever submits next.
-        if (seq !== 0 && seq === this.consentReservationSeq) {
-          this.consentNextSlotAt = slot;
-          this.consentReservationSeq -= 1;
-        }
-        cleanup();
-        resolve(false);
-      };
-      const cleanup = (): void => {
-        req.off('aborted', onGone);
-        res_off();
-      };
-      const res = req.res;
-      const res_off = (): void => {
-        res?.off('close', onCloseIfUnsent);
-      };
-      const onCloseIfUnsent = (): void => {
-        if (!res || !res.writableEnded) onGone();
-      };
-      req.on('aborted', onGone);
-      res?.on('close', onCloseIfUnsent);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
     });
+
+    const ahead = this.consentChain;
+    // Append first, so concurrent submissions order behind one another rather
+    // than all reading the same tail.
+    this.consentChain = ahead.then(() => held);
+
+    const entry = { timer: undefined as NodeJS.Timeout | undefined, settle: release };
+    this.pendingConsentWaits.add(entry);
+
+    // Raced against the wait, not checked after it. A submission that hangs up
+    // has to leave the queue immediately: parked until its turn came, it went
+    // on occupying a queue slot for the whole time everything ahead of it was
+    // being spaced out, which kept the queue full and had every later
+    // submission refused. That is the lockout, one layer further in.
+    let abandon!: () => void;
+    const abandoned = new Promise<'gone'>((resolve) => {
+      abandon = () => resolve('gone');
+    });
+    const res = req.res;
+    const onClose = (): void => {
+      if (!res || !res.writableEnded) abandon();
+    };
+    req.on('aborted', abandon);
+    res?.on('close', onClose);
+
+    try {
+      const outcome = await Promise.race([ahead.then(() => 'turn' as const), abandoned]);
+
+      if (outcome === 'gone') {
+        // Release at once, so this submission costs the next one nothing. The
+        // chain still runs through this link; it simply holds no interval.
+        this.pendingConsentWaits.delete(entry);
+        release();
+        return false;
+      }
+
+      // Hold the chain for one interval, so the next check is spaced from this
+      // one. The check itself happens in the caller, immediately after this
+      // returns.
+      const interval = consentIntervalFor(this.consentFailures + 1);
+      entry.timer = setTimeout((): void => {
+        this.pendingConsentWaits.delete(entry);
+        release();
+      }, interval);
+      entry.settle = (): void => {
+        if (entry.timer) clearTimeout(entry.timer);
+        this.pendingConsentWaits.delete(entry);
+        release();
+      };
+      return true;
+    } finally {
+      req.off('aborted', abandon);
+      res?.off('close', onClose);
+    }
   }
 
   private registerConsentFailure(): void {
@@ -557,15 +553,7 @@ export class HttpTransportHost {
     return this.consentQueueDepth;
   }
 
-  /**
-   * Exposed for tests: how far ahead of now the check cursor sits, in ms.
-   *
-   * This is the number an attacker tries to inflate, and the one that bounds
-   * how long the operator can be made to wait.
-   */
-  get consentSlotAheadMs(): number {
-    return Math.max(0, this.consentNextSlotAt - Date.now());
-  }
+
 
   /**
    * Check that the caller owns the session it names.
@@ -808,10 +796,10 @@ export class HttpTransportHost {
       this.sessionSweeper = undefined;
     }
 
-    // Settle anything sleeping on a check slot first. `httpServer.close()`
-    // waits for in-flight requests, and a submission parked on a 30 second
-    // timer is in-flight, so without this a graceful shutdown stalled for
-    // minutes and ended in a SIGKILL.
+    // Settle anything holding the chain first. `httpServer.close()` waits for
+    // in-flight requests, and a submission parked on a 30 second interval is
+    // in-flight, so without this a graceful shutdown stalled for minutes and
+    // ended in a SIGKILL.
     for (const entry of [...this.pendingConsentWaits]) entry.settle();
     this.pendingConsentWaits.clear();
 
