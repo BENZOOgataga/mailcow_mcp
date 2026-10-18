@@ -36,6 +36,47 @@ npm run build && npm start
 
 👉 **Detailed setup**: [Quick Start Guide](docs/QUICK_START.md)
 
+## 🌐 Remote access (Claude web, ChatGPT)
+
+By default the server runs over **stdio** — a local process launched by a
+desktop client, with nothing listening on the network.
+
+To use it as a custom connector from Claude on the web or from ChatGPT, set
+`MCP_TRANSPORT=http`. That starts a **Streamable HTTP** endpoint together with
+an **OAuth 2.1** authorization server (authorization code + PKCE, dynamic
+client registration, refresh and revocation), because neither client can send a
+static bearer header.
+
+```bash
+MCP_TRANSPORT=http
+MCP_HTTP_HOST=127.0.0.1
+MCP_HTTP_PORT=3000
+MCP_PUBLIC_URL=https://mcp.example.com
+MCP_OAUTH_PASSWORD=                 # required; no default
+```
+
+Put a TLS-terminating reverse proxy in front: this server does not terminate
+TLS. A `Dockerfile` and `docker-compose.yml` are included.
+
+### Tools withheld by default
+
+Two groups are implemented but **not registered** unless you opt in, so they do
+not appear in `tools/list` at all:
+
+| Flag | Tools | Why |
+|---|---|---|
+| `MCP_ENABLE_DESTRUCTIVE_TOOLS` | `delete_domain`, `delete_mailbox`, `delete_user`, `delete_dkim_key`, `update_dkim_key`, `delete_queue_items` | permanently destroy mail, or break DKIM signing silently until DNS catches up |
+| `MCP_ENABLE_OUTBOUND_TOOLS` | `send_email` | lets a model send mail from your domains |
+
+A mail server administered by a model that also *reads* mail has an unusual
+property: its input is attacker-controlled by design. Anyone who knows an
+address on your server can put text in front of the model. Keeping destructive
+tools unregistered, and using a **read-only** mailcow API key, are the two
+controls that hold regardless of how the model behaves.
+
+👉 **Full guide, threat model and proxy configuration**:
+[Remote Deployment](docs/REMOTE_DEPLOYMENT.md)
+
 ## 🛠️ Available Tools
 
 ### Email Management (18 tools)

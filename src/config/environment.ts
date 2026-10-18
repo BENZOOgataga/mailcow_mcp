@@ -47,7 +47,53 @@ export function loadEnvironmentConfig(): Partial<MailcowConfig> {
   if (process.env.LOG_FILE_PATH) logging.filePath = process.env.LOG_FILE_PATH;
   if (Object.keys(logging).length > 0) config.logging = logging as MailcowConfig['logging'];
 
+  // Transport Configuration
+  config.transport = loadTransportConfig();
+
   return config;
+}
+
+/**
+ * Load transport and tool-exposure settings.
+ *
+ * Every default here is the conservative one: stdio, loopback, and no
+ * destructive or outbound tools. A deployment becomes remote and becomes
+ * capable of destroying mail only because someone said so explicitly.
+ */
+export function loadTransportConfig(): MailcowConfig['transport'] {
+  const mode = process.env.MCP_TRANSPORT === 'http' ? 'http' : 'stdio';
+
+  const port = parseInt(process.env.MCP_HTTP_PORT ?? '', 10);
+  const publicUrl =
+    process.env.MCP_PUBLIC_URL ??
+    `http://${process.env.MCP_HTTP_HOST ?? '127.0.0.1'}:${isNaN(port) ? 3000 : port}`;
+
+  return {
+    mode,
+    http: {
+      host: process.env.MCP_HTTP_HOST ?? '127.0.0.1',
+      port: isNaN(port) ? 3000 : port,
+      publicUrl,
+      oauthPassword: process.env.MCP_OAUTH_PASSWORD ?? '',
+      trustProxy: isTrue(process.env.MCP_TRUST_PROXY),
+    },
+    tools: {
+      enableDestructive: isTrue(process.env.MCP_ENABLE_DESTRUCTIVE_TOOLS),
+      enableOutbound: isTrue(process.env.MCP_ENABLE_OUTBOUND_TOOLS),
+    },
+  };
+}
+
+/**
+ * Strict truthiness for environment flags.
+ *
+ * Only the exact string `true` enables a flag. Anything else — including
+ * `1`, `yes`, `TRUE ` with a stray space, or a value the shell failed to
+ * substitute — leaves it off. For flags that gate mail destruction, failing
+ * closed on a typo is the only acceptable behaviour.
+ */
+function isTrue(value: string | undefined): boolean {
+  return value === 'true';
 }
 
 /**

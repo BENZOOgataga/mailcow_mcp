@@ -12,6 +12,9 @@ dotenv.config();
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import { HttpTransportHost } from './transport/http.js';
+import { MailcowOAuthProvider } from './auth/oauth-provider.js';
+import { ToolPolicy } from './tools/policy.js';
 
 // Import existing components
 import { configManager } from './config/index.js';
@@ -48,6 +51,7 @@ class MailcowMCPServer {
   private toolRegistry: ToolRegistry;
   private logger: Logger;
   private isInitialized = false;
+  private httpHost: HttpTransportHost | null = null;
 
   constructor() {
     // Initialize MCP Server
@@ -55,7 +59,16 @@ class MailcowMCPServer {
       {
         name: 'mailcow-mcp',
         version: '0.1.0',
-      }
+      },
+      {
+        // Capabilities must be declared before the matching request handlers
+        // are installed. Older SDK versions did not enforce this, so the
+        // omission was silent; from 1.x `setRequestHandler` throws
+        // "Server does not support tools" at construction time.
+        capabilities: {
+          tools: {},
+        },
+      },
     );
 
     // Initialize logger
@@ -118,6 +131,24 @@ class MailcowMCPServer {
       } else {
         this.logger.warn('No API key provided - server will run in limited mode');
       }
+
+      // Apply the tool exposure policy before anything is registered.
+      //
+      // Which tools exist at all depends on how this server is reachable. Over
+      // stdio the only caller is the user who launched it; over HTTP the caller
+      // is a model that may have read untrusted content. The policy encodes
+      // that difference, so it must be in place before the first register().
+      const transport = config.transport;
+      const policy = new ToolPolicy({
+        remote: transport?.mode === 'http',
+        enableDestructive: transport?.tools.enableDestructive ?? false,
+        enableOutbound: transport?.tools.enableOutbound ?? false,
+      });
+      this.toolRegistry.setPolicy(policy);
+      for (const warning of policy.warnings()) {
+        this.logger.warn(warning);
+      }
+      this.logger.info('Tool exposure policy applied', policy.describe());
 
       // Register available tools
       await this.registerTools();
@@ -1082,20 +1113,77 @@ class MailcowMCPServer {
       // Initialize server components
       await this.initialize();
 
-      // Create transport and connect
-      const transport = new StdioServerTransport();
-      
       this.logger.info('Starting Mailcow MCP Server...');
-      
-      // Connect server to transport
-      await this.server.connect(transport);
-      
+
+      const transportConfig = configManager.getConfig().transport;
+
+      if (transportConfig?.mode === 'http') {
+        await this.startHttpTransport(transportConfig);
+      } else {
+        // Default. One client, one process, no network surface.
+        const transport = new StdioServerTransport();
+        await this.server.connect(transport);
+      }
+
       this.logger.info('Mailcow MCP Server started successfully');
-      
+
     } catch (error) {
       this.logger.error('Failed to start server', error as Error);
       process.exit(1);
     }
+  }
+
+  /**
+   * Start the Streamable HTTP transport.
+   *
+   * Separated from start() because remote serving has preconditions that stdio
+   * does not, and they are worth failing loudly on rather than starting a
+   * half-protected listener.
+   */
+  private async startHttpTransport(
+    transportConfig: NonNullable<ReturnType<typeof configManager.getConfig>['transport']>,
+  ): Promise<void> {
+    const { host, port, publicUrl, oauthPassword, trustProxy } = transportConfig.http;
+
+    if (!oauthPassword) {
+      throw new Error(
+        'MCP_TRANSPORT=http requires MCP_OAUTH_PASSWORD. Refusing to start a ' +
+          'network-reachable mail administration endpoint with no authentication.',
+      );
+    }
+
+    let parsedPublicUrl: URL;
+    try {
+      parsedPublicUrl = new URL(publicUrl);
+    } catch {
+      throw new Error(`MCP_PUBLIC_URL is not a valid URL: ${publicUrl}`);
+    }
+
+    // OAuth redirect URIs and the metadata documents are built from this URL.
+    // If it is wrong, clients fail at the authorization step with errors that
+    // point nowhere near the cause, so check it here instead.
+    if (parsedPublicUrl.protocol !== 'https:' && parsedPublicUrl.hostname !== 'localhost' && parsedPublicUrl.hostname !== '127.0.0.1') {
+      this.logger.warn(
+        `MCP_PUBLIC_URL uses ${parsedPublicUrl.protocol} for a non-local host. ` +
+          'Remote MCP clients require HTTPS; this will only work if a proxy terminates TLS in front.',
+      );
+    }
+
+    const provider = new MailcowOAuthProvider({
+      operatorPassword: oauthPassword,
+      issuerUrl: parsedPublicUrl,
+    });
+
+    this.httpHost = new HttpTransportHost(this.server, {
+      host,
+      port,
+      publicUrl: parsedPublicUrl,
+      provider,
+      logger: this.logger,
+      trustProxy,
+    });
+
+    await this.httpHost.start();
   }
 
   /**
@@ -1104,7 +1192,12 @@ class MailcowMCPServer {
   async stop(): Promise<void> {
     try {
       this.logger.info('Stopping Mailcow MCP Server...');
-      
+
+      if (this.httpHost) {
+        await this.httpHost.stop();
+        this.httpHost = null;
+      }
+
       // Close server connection
       if (this.server) {
         await this.server.close();
