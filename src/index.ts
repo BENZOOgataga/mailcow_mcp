@@ -14,7 +14,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { HttpTransportHost } from './transport/http.js';
 import { MailcowOAuthProvider } from './auth/oauth-provider.js';
-import { ToolPolicy } from './tools/policy.js';
+import { ToolPolicy, scopeFor } from './tools/policy.js';
 
 // Import existing components
 import { configManager } from './config/index.js';
@@ -54,8 +54,34 @@ class MailcowMCPServer {
   private httpHost: HttpTransportHost | null = null;
 
   constructor() {
-    // Initialize MCP Server
-    this.server = new Server(
+    // Initialize logger
+    this.logger = new Logger(
+      { level: 'info' },
+      new ConsoleLogDestination()
+    );
+
+    // Initialize components
+    this.authManager = new AuthManager();
+    this.toolRegistry = new ToolRegistry(this.logger);
+
+    // The protocol object for the stdio transport. The HTTP transport builds
+    // one per session through the same factory; see createMcpServer.
+    this.server = this.createMcpServer();
+  }
+
+  /**
+   * Build an MCP protocol object with this server's handlers installed.
+   *
+   * One of these per transport, because a `Server` can be connected exactly
+   * once: the second `connect()` throws `Already connected to a transport`.
+   * The HTTP transport therefore calls this per session.
+   *
+   * Only the protocol object is per-session. Everything behind the handlers
+   * (the tool registry, the API client, the configuration) is shared, which is
+   * what you want: separate conversations against the same mailcow.
+   */
+  private createMcpServer(): Server {
+    const server = new Server(
       {
         name: 'mailcow-mcp',
         version: '0.1.0',
@@ -71,18 +97,8 @@ class MailcowMCPServer {
       },
     );
 
-    // Initialize logger
-    this.logger = new Logger(
-      { level: 'info' },
-      new ConsoleLogDestination()
-    );
-
-    // Initialize components
-    this.authManager = new AuthManager();
-    this.toolRegistry = new ToolRegistry(this.logger);
-
-    // Set up MCP protocol handlers
-    this.setupProtocolHandlers();
+    this.setupProtocolHandlers(server);
+    return server;
   }
 
   /**
@@ -166,9 +182,9 @@ class MailcowMCPServer {
   /**
    * Set up MCP protocol request handlers
    */
-  private setupProtocolHandlers(): void {
+  private setupProtocolHandlers(server: Server): void {
     // Handle tool listing
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
       const tools = this.toolRegistry.getToolSchemas();
       this.logger.debug(`Listing ${tools.length} available tools`);
       
@@ -182,13 +198,42 @@ class MailcowMCPServer {
     });
 
     // Handle tool execution
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const { name: toolName, arguments: toolArgs } = request.params;
-      
-      this.logger.info(`Executing tool: ${toolName}`, { 
+
+      this.logger.info(`Executing tool: ${toolName}`, {
         tool: toolName,
-        hasArgs: !!toolArgs 
+        hasArgs: !!toolArgs
       });
+
+      // Scope enforcement, for network callers only.
+      //
+      // `authInfo` is present when the request arrived over the HTTP transport,
+      // where it comes from the bearer token. Over stdio there is no token and
+      // no authInfo, and the caller is the user who launched the process.
+      //
+      // Without this the advertised scopes are decorative: they appear in the
+      // metadata document and in what the operator approves on the consent
+      // screen, and then nothing checks them at the point of use.
+      const authInfo = extra?.authInfo;
+      if (authInfo) {
+        const required = scopeFor(toolName);
+        if (!authInfo.scopes.includes(required)) {
+          this.logger.warn('Tool call rejected for insufficient scope', {
+            tool: toolName,
+            required,
+            granted: authInfo.scopes,
+            clientId: authInfo.clientId,
+          });
+          return {
+            content: [{
+              type: 'text',
+              text: `insufficient_scope: ${toolName} requires the ${required} scope.`,
+            }],
+            isError: true,
+          };
+        }
+      }
 
       try {
         // Create execution context
@@ -231,7 +276,7 @@ class MailcowMCPServer {
     });
 
     // Handle server shutdown
-    this.server.onerror = (error) => {
+    server.onerror = (error) => {
       this.logger.error('MCP Server error', error);
     };
   }
@@ -1175,7 +1220,7 @@ class MailcowMCPServer {
       issuerUrl: parsedPublicUrl,
     });
 
-    this.httpHost = new HttpTransportHost(this.server, {
+    this.httpHost = new HttpTransportHost(() => this.createMcpServer(), {
       host,
       port,
       publicUrl: parsedPublicUrl,

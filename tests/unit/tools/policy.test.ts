@@ -22,6 +22,7 @@ import {
   CREDENTIAL_TOOLS,
   OUTBOUND_TOOLS,
   tierOf,
+  scopeFor,
 } from '../../../src/tools/policy';
 
 describe('ToolPolicy', () => {
@@ -73,6 +74,52 @@ describe('ToolPolicy', () => {
     // check is not what the policy uses.
     expect(tierOf('update_dkim_key')).toBe('destructive');
     expect(tierOf('send_email')).toBe('outbound');
+  });
+
+  /**
+   * Scope is the second gate, and it has to agree with the first.
+   *
+   * Registration decides whether a tool exists for a deployment; scope decides
+   * whether a given token may call one that does. If a tool could be a write
+   * for one gate and a read for the other, a read-only token would reach it.
+   */
+  describe('scopeFor', () => {
+    it('requires the write scope for every gated tool', () => {
+      for (const tool of [...DESTRUCTIVE_TOOLS, ...CREDENTIAL_TOOLS, ...OUTBOUND_TOOLS]) {
+        expect(scopeFor(tool)).toBe('mailcow:write');
+      }
+    });
+
+    it('requires only the read scope for read tools', () => {
+      for (const tool of ['list_domains', 'get_mailbox', 'check_email_status', 'health_check']) {
+        expect(scopeFor(tool)).toBe('mailcow:read');
+      }
+    });
+
+    it('requires the write scope for ungated write tools', () => {
+      for (const tool of ['create_domain', 'flush_queue', 'hold_queue_items']) {
+        expect(scopeFor(tool)).toBe('mailcow:write');
+      }
+    });
+
+    it('fails closed on a tool it does not recognise', () => {
+      // A new tool whose name matches none of the read prefixes must default to
+      // the restrictive scope rather than slipping through unscoped.
+      expect(scopeFor('frobnicate_everything')).toBe('mailcow:write');
+    });
+
+    it('agrees with tierOf on every tool', () => {
+      const tools = [
+        ...DESTRUCTIVE_TOOLS,
+        ...CREDENTIAL_TOOLS,
+        ...OUTBOUND_TOOLS,
+        'list_domains',
+        'create_domain',
+      ];
+      for (const tool of tools) {
+        expect(scopeFor(tool)).toBe(tierOf(tool) === 'read' ? 'mailcow:read' : 'mailcow:write');
+      }
+    });
   });
 
   it('warns when destructive tools are enabled on a network transport', () => {

@@ -143,6 +143,19 @@ export function tierOf(toolName: string): ToolTier {
 }
 
 /**
+ * OAuth scope a tool requires.
+ *
+ * Derived from `tierOf` rather than listed separately, so a new tool cannot be
+ * classified as a write for registration purposes and a read for authorization
+ * purposes. Anything not demonstrably read-only needs the write scope: the
+ * default is the restrictive one, so a tool whose name does not match the read
+ * prefixes fails closed rather than slipping through unscoped.
+ */
+export function scopeFor(toolName: string): 'mailcow:read' | 'mailcow:write' {
+  return tierOf(toolName) === 'read' ? 'mailcow:read' : 'mailcow:write';
+}
+
+/**
  * Tool exposure policy.
  *
  * Construct once at startup and consult before every `register()` call.
