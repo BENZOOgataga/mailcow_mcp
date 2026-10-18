@@ -65,7 +65,8 @@ not appear in `tools/list` at all:
 
 | Flag | Tools | Why |
 |---|---|---|
-| `MCP_ENABLE_DESTRUCTIVE_TOOLS` | `delete_domain`, `delete_mailbox`, `delete_user`, `delete_dkim_key`, `update_dkim_key`, `delete_queue_items` | permanently destroy mail, or break DKIM signing silently until DNS catches up |
+| `MCP_ENABLE_DESTRUCTIVE_TOOLS` | `delete_domain`, `delete_mailbox`, `delete_user`, `delete_dkim_key`, `update_dkim_key`, `delete_queue_items`, `delete_sync_job`, `update_domain`, `create_dkim_key` | permanently destroy mail, or break mail flow and DKIM signing silently |
+| `MCP_ENABLE_CREDENTIAL_TOOLS` | `update_mailbox`, `update_user`, `create_mailbox`, `create_user`, `create_sync_job`, `update_sync_job` | set or accept a credential — mint or take over an identity that authenticates directly, outside this server |
 | `MCP_ENABLE_OUTBOUND_TOOLS` | `send_email` | lets a model send mail from your domains |
 
 A mail server administered by a model that also *reads* mail has an unusual

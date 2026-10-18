@@ -175,7 +175,7 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
 
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.setHeader('Cache-Control', 'no-store');
-    res.send(consentPage(client, pending));
+    res.send(consentPage(client, pending, params.redirectUri));
   }
 
   /**
@@ -336,8 +336,29 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
  * able to do, because an operator approving mail-server access should see that
  * before typing a password.
  */
-function consentPage(client: OAuthClientInformationFull, pending: string): string {
+function consentPage(
+  client: OAuthClientInformationFull,
+  pending: string,
+  redirectUri: string,
+): string {
+  // client_name is chosen by whoever registered the client. With dynamic
+  // registration open, that is anyone on the internet — so an attacker can
+  // register a client called "Claude", point its redirect at a host they
+  // control, and send the operator a genuine authorization URL on the right
+  // domain with valid TLS. Nothing about the name can be trusted.
+  //
+  // The redirect target is the one field the attacker cannot disguise: it is
+  // where the authorization code will actually be sent. Showing it, and
+  // showing its origin separately and prominently, is what lets an operator
+  // tell the real flow from the forged one.
   const name = escapeHtml(client.client_name ?? client.client_id);
+  const target = escapeHtml(redirectUri);
+  let origin: string;
+  try {
+    origin = escapeHtml(new URL(redirectUri).origin);
+  } catch {
+    origin = '(unparseable)';
+  }
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -349,6 +370,11 @@ function consentPage(client: OAuthClientInformationFull, pending: string): strin
   body { font: 16px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 4rem auto; padding: 0 1rem; }
   .client { font-weight: 600; }
   .warn { border-left: 3px solid #c2410c; padding: .5rem 0 .5rem .75rem; margin: 1.5rem 0; }
+  .dest { border: 2px solid #c2410c; border-radius: 4px; padding: .75rem 1rem; margin: 1.5rem 0; }
+  .dest-label { font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; opacity: .75; }
+  .dest-origin { font-size: 1.35rem; font-weight: 700; font-family: ui-monospace, monospace; word-break: break-all; margin: .25rem 0; }
+  .dest-full { font-size: .8rem; opacity: .7; font-family: ui-monospace, monospace; word-break: break-all; }
+  code { font-family: ui-monospace, monospace; }
   label { display: block; margin: 1.5rem 0 .25rem; font-weight: 600; }
   input[type=password] { width: 100%; padding: .6rem; font-size: 1rem; box-sizing: border-box; }
   button { margin-top: 1rem; padding: .6rem 1.2rem; font-size: 1rem; cursor: pointer; }
@@ -356,11 +382,27 @@ function consentPage(client: OAuthClientInformationFull, pending: string): strin
 </head>
 <body>
   <h1>Authorize access to mailcow</h1>
-  <p><span class="client">${name}</span> is requesting access to your mailcow server through this MCP server.</p>
+  <p>A client calling itself <span class="client">${name}</span> is requesting access
+     to your mailcow server.</p>
+
+  <div class="dest">
+    <div class="dest-label">The authorization code will be sent to</div>
+    <div class="dest-origin">${origin}</div>
+    <div class="dest-full">${target}</div>
+  </div>
+
   <div class="warn">
-    Approving this grants the client the tools this server has registered, which may
-    include creating and modifying mailboxes, aliases and domains. Only continue if
-    you started this authorization yourself.
+    <strong>Check that destination.</strong> The client name above is chosen by
+    whoever registered the client and proves nothing. If that origin is not one
+    you recognise as belonging to the service you are connecting — for example
+    <code>claude.ai</code> or <code>chatgpt.com</code> — stop now: approving would
+    hand control of this mail server to whoever owns it.
+  </div>
+
+  <div class="warn">
+    Approving grants the tools this server has registered, which may include
+    creating and modifying mailboxes, aliases and domains. Only continue if you
+    started this authorization yourself, just now.
   </div>
   <form method="POST" action="${CONSENT_SUBMIT_PATH}">
     <input type="hidden" name="pending" value="${pending}">

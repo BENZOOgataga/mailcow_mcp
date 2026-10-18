@@ -35,6 +35,64 @@ export const DESTRUCTIVE_TOOLS: readonly string[] = [
   'delete_dkim_key',
   'update_dkim_key',
   'delete_queue_items',
+  'delete_sync_job',
+
+  // The four below are "update" and "create" tools, and gating them is not
+  // obvious until you look at what their inputs allow.
+  //
+  // update_mailbox and update_user accept a `password` field. Setting a
+  // mailbox password is the single highest-value action on this server: it
+  // does not destroy anything, so a deny-list built around the word "delete"
+  // misses it entirely, and it yields every outcome the other entries here
+  // exist to prevent. Whoever learns the new password reads all of that
+  // mailbox's mail, sends authenticated mail from a trusted domain, and
+  // deletes whatever they like — reached without a single delete tool and
+  // without send_email. Reset postmaster@ and that is the whole domain.
+  //
+  // update_domain and update_mailbox can also set `active: 0`, which stops
+  // mail flow silently. That is the same quiet-breakage argument made for
+  // update_dkim_key above.
+  //
+  // create_dkim_key is here because mailcow's /api/v1/add/dkim is not
+  // documented to reject a domain that already holds a key. If it regenerates
+  // instead, "create" reproduces exactly the DMARC breakage update_dkim_key is
+  // gated for. Gated until someone verifies the behaviour against a real
+  // mailcow; if it does reject, it can move back to the write tier.
+  'update_domain',
+  'create_dkim_key',
+] as const;
+
+/**
+ * Tools that set or accept a credential.
+ *
+ * Separate from DESTRUCTIVE because the remedy and the appetite differ. These
+ * destroy nothing — which is exactly why a deny-list built around the word
+ * "delete" misses every one of them — but each mints or changes an identity
+ * that can then authenticate to the mail system directly, outside this server
+ * and outside anything a model or an approval dialog can mediate.
+ *
+ *   update_mailbox / update_user  set the password of an EXISTING mailbox.
+ *     Reset postmaster@ and whoever reads the new password owns the domain:
+ *     they read all of its mail, send authenticated mail from it, and delete
+ *     what they like. No delete tool and no send_email required.
+ *
+ *   create_mailbox / create_user  mint a NEW authenticated identity on a
+ *     domain recipients already trust. billing@yourcompany.example with a
+ *     known password is a phishing primitive, again without send_email.
+ *
+ *   create_sync_job / update_sync_job  accept third-party IMAP credentials
+ *     and pull remote mail into a local mailbox.
+ *
+ * Enabled separately so an operator can have mailbox administration without
+ * also exposing deletion, which is the common case.
+ */
+export const CREDENTIAL_TOOLS: readonly string[] = [
+  'update_mailbox',
+  'update_user',
+  'create_mailbox',
+  'create_user',
+  'create_sync_job',
+  'update_sync_job',
 ] as const;
 
 /**
@@ -49,13 +107,15 @@ export const DESTRUCTIVE_TOOLS: readonly string[] = [
  */
 export const OUTBOUND_TOOLS: readonly string[] = ['send_email'] as const;
 
-export type ToolTier = 'read' | 'write' | 'destructive' | 'outbound';
+export type ToolTier = 'read' | 'write' | 'destructive' | 'credential' | 'outbound';
 
 export interface ToolPolicyOptions {
   /** True when the server is reachable over the network rather than stdio. */
   remote: boolean;
   /** Opt-in for the tools in DESTRUCTIVE_TOOLS. Defaults to false. */
   enableDestructive: boolean;
+  /** Opt-in for the tools in CREDENTIAL_TOOLS. Defaults to false. */
+  enableCredential: boolean;
   /** Opt-in for the tools in OUTBOUND_TOOLS. Defaults to false. */
   enableOutbound: boolean;
 }
@@ -76,6 +136,7 @@ export interface PolicyDecision {
  */
 export function tierOf(toolName: string): ToolTier {
   if (DESTRUCTIVE_TOOLS.includes(toolName)) return 'destructive';
+  if (CREDENTIAL_TOOLS.includes(toolName)) return 'credential';
   if (OUTBOUND_TOOLS.includes(toolName)) return 'outbound';
   if (/^(list|get|check|test|health)/.test(toolName)) return 'read';
   return 'write';
@@ -99,6 +160,15 @@ export class ToolPolicy {
         tier,
         reason:
           'destructive tools are disabled; set MCP_ENABLE_DESTRUCTIVE_TOOLS=true to enable',
+      };
+    }
+
+    if (tier === 'credential' && !this.options.enableCredential) {
+      return {
+        allowed: false,
+        tier,
+        reason:
+          'credential-setting tools are disabled; set MCP_ENABLE_CREDENTIAL_TOOLS=true to enable',
       };
     }
 
@@ -136,6 +206,15 @@ export class ToolPolicy {
       );
     }
 
+    if (this.options.enableCredential && this.options.remote) {
+      out.push(
+        'CREDENTIAL TOOLS ARE ENABLED ON A NETWORK-REACHABLE TRANSPORT. ' +
+          `Tools that set mailbox passwords (${CREDENTIAL_TOOLS.join(', ')}) ` +
+          'can mint or take over an identity that then authenticates to the mail ' +
+          'system directly, outside this server.',
+      );
+    }
+
     if (this.options.enableOutbound && this.options.remote) {
       out.push(
         'OUTBOUND MAIL TOOLS ARE ENABLED ON A NETWORK-REACHABLE TRANSPORT. ' +
@@ -152,8 +231,10 @@ export class ToolPolicy {
     return {
       remote: this.options.remote,
       destructiveToolsEnabled: this.options.enableDestructive,
+      credentialToolsEnabled: this.options.enableCredential,
       outboundToolsEnabled: this.options.enableOutbound,
       destructiveTools: DESTRUCTIVE_TOOLS,
+      credentialTools: CREDENTIAL_TOOLS,
       outboundTools: OUTBOUND_TOOLS,
     };
   }

@@ -72,6 +72,27 @@ DNS propagates: mail keeps flowing while receivers start failing DMARC, and
 nothing alerts you. It is the most dangerous tool here precisely because it is
 quiet.
 
+### Credential-setting — `MCP_ENABLE_CREDENTIAL_TOOLS`
+
+`update_mailbox` · `update_user` · `create_mailbox` · `create_user` ·
+`create_sync_job` · `update_sync_job`
+
+These destroy nothing, and that is precisely the problem: a deny-list built by
+thinking about which tools *delete* things misses every one of them.
+
+`update_mailbox` accepts a `password` field. A model that has read an injected
+instruction resets `postmaster@yourdomain`, and whoever reads the new password
+logs in over IMAP — reading all mail, sending authenticated mail from a trusted
+domain, deleting whatever they like. Every outcome the destructive group exists
+to prevent, reached without a single delete tool.
+
+`create_mailbox` is the same shape one step removed: it mints a new
+authenticated identity on a domain recipients already trust.
+`billing@yourcompany.example` with a known password is a phishing primitive.
+
+Separated from the destructive group so you can have mailbox administration
+without also exposing deletion, which is the common case.
+
 ### Outbound — `MCP_ENABLE_OUTBOUND_TOOLS`
 
 `send_email`

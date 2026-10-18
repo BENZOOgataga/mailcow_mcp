@@ -51,6 +51,12 @@ export interface ToolExposureConfig {
    * Off by default; see src/tools/policy.ts for the list and the reasoning.
    */
   enableDestructive: boolean;
+  /**
+   * Register tools that set or accept a credential — mailbox passwords, sync
+   * job credentials. These destroy nothing but mint or take over an identity
+   * that can then authenticate to the mail system directly. Off by default.
+   */
+  enableCredential: boolean;
   /** Register tools that can send mail as your domains. Off by default. */
   enableOutbound: boolean;
 }

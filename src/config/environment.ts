@@ -79,6 +79,7 @@ export function loadTransportConfig(): MailcowConfig['transport'] {
     },
     tools: {
       enableDestructive: isTrue(process.env.MCP_ENABLE_DESTRUCTIVE_TOOLS),
+      enableCredential: isTrue(process.env.MCP_ENABLE_CREDENTIAL_TOOLS),
       enableOutbound: isTrue(process.env.MCP_ENABLE_OUTBOUND_TOOLS),
     },
   };

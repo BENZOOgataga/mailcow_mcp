@@ -142,6 +142,7 @@ class MailcowMCPServer {
       const policy = new ToolPolicy({
         remote: transport?.mode === 'http',
         enableDestructive: transport?.tools.enableDestructive ?? false,
+        enableCredential: transport?.tools.enableCredential ?? false,
         enableOutbound: transport?.tools.enableOutbound ?? false,
       });
       this.toolRegistry.setPolicy(policy);
