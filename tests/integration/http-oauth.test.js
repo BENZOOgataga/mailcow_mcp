@@ -305,24 +305,27 @@ async function main() {
 
     // --- consent throttling --------------------------------------------------
     //
-    // Two defects lived here, and both are the reason this section is not just
-    // "a wrong password is rejected".
+    // This section exists because the throttle here was wrong three times, and
+    // each assertion below pins one of those.
     //
-    // The backoff was keyed on a hash of the consent blob so that one caller's
-    // failures could not slow another's. An attacker resets that for free:
-    // /authorize needs no authentication and registration is open, so they
-    // fetch a fresh consent page before each guess, every guess is the first
-    // failure for its own key, and the delay never leaves its first step. The
-    // count is global now, and this asserts a fresh page does not reset it.
+    // It was keyed on a hash of the consent page, so one caller could not slow
+    // another. An attacker resets that for free: /authorize needs no
+    // authentication and registration is open, so a fresh page before each
+    // guess makes every guess the first failure for its own key.
     //
-    // The saturation guard also ran before the password was checked, so an
-    // attacker holding failures open had the operator's own correct submission
-    // answered with 503. That is the lockout the route exists to avoid, and the
-    // flood case below is what catches it.
+    // The saturation guard then ran before the password was checked, so a
+    // flood of failures had the operator's own correct submission answered
+    // with a 503.
+    //
+    // And the delay was applied to the *reply* rather than to the *check*,
+    // which bounded latency and not guessing: saturate the route and every
+    // guess was still evaluated at full speed, a wrong one dropped at once and
+    // a right one redirected at once. That is a negative oracle, and it is why
+    // a correct password now waits its turn like everything else.
     let sawTooManyRequests = false;
 
     async function consentAttempt(password) {
-      // A new consent page every time, which is exactly what an attacker does.
+      // A fresh consent page every time, which is exactly what an attacker does.
       const blob = await newGrantBlob(client.client_id);
       const started = Date.now();
       const attempt = await fetch(`${BASE}/authorize/consent`, {
@@ -336,66 +339,58 @@ async function main() {
     }
 
     const firstFailure = await consentAttempt('wrong-one');
-    const secondFailure = await consentAttempt('wrong-two');
     check('a wrong password is rejected', firstFailure.status === 401, `status ${firstFailure.status}`);
-    check(
-      'a fresh consent page does not reset the backoff',
-      secondFailure.elapsed > firstFailure.elapsed + 400,
-      `${firstFailure.elapsed}ms then ${secondFailure.elapsed}ms`,
-    );
 
-    // Flood the route and leave the rejections pending, so the in-flight
-    // budget is spent, then submit the correct password.
-    const flood = [];
-    for (let i = 0; i < 24; i++) {
-      flood.push(
-        newGrantBlob(client.client_id)
-          .then((blob) =>
-            fetch(`${BASE}/authorize/consent`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-              body: new URLSearchParams({ pending: blob, password: `flood-${i}` }),
-              redirect: 'manual',
-            }),
-          )
-          // Past the budget the server drops the connection rather than hold
-          // or answer it, so a rejected fetch here is the design working.
-          .catch(() => null),
-      );
-    }
-    await new Promise((r) => setTimeout(r, 600));
-
-    const rescueBlob = await newGrantBlob(client.client_id);
-    const rescueStarted = Date.now();
-    const rescue = await fetch(`${BASE}/authorize/consent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ pending: rescueBlob, password: PASSWORD }),
-      redirect: 'manual',
-    });
-    const rescueElapsed = Date.now() - rescueStarted;
-    if (rescue.status === 429) sawTooManyRequests = true;
+    // The guarantee is a bound on how often a guess is *checked*, server-wide,
+    // whatever concurrency the attacker brings. Four guesses fired at once,
+    // each with its own freshly rendered consent page, must therefore take
+    // several seconds in total rather than finishing together: they are
+    // serialized behind the check slot, and a fresh page does not buy a caller
+    // a slot of its own.
+    const burstStarted = Date.now();
+    const burst = await Promise.all([
+      consentAttempt('burst-one'),
+      consentAttempt('burst-two'),
+      consentAttempt('burst-three'),
+      consentAttempt('burst-four'),
+    ]);
+    const burstElapsed = Date.now() - burstStarted;
 
     check(
-      'the correct password is accepted while the route is saturated with failures',
-      rescue.status === 302,
-      `status ${rescue.status}`,
+      'concurrent guesses are all rejected',
+      burst.every((attempt) => attempt.status === 401),
+      burst.map((a) => a.status).join(','),
     );
     check(
-      'and it is answered without the failure delay',
-      rescueElapsed < 1500,
-      `${rescueElapsed}ms`,
+      'concurrent guesses are checked one at a time, not all at once',
+      burstElapsed > 2500,
+      `four concurrent guesses resolved in ${burstElapsed}ms, which would mean the check rate is unbounded`,
     );
-    check('no rejection is ever answered with 429', !sawTooManyRequests);
 
-    // The successful submission cleared the counter, so the flows below are
-    // not slowed by the flood. Only a correct password clears it; guessing
-    // cannot.
-    const afterRescue = await consentAttempt(PASSWORD);
+    // The one that catches the oracle: after failures have accumulated, a
+    // correct password must wait for its slot too. If it comes back promptly
+    // while wrong answers are being throttled, the response time is the
+    // verdict and the throttle is decorative.
+    const throttledSuccess = await consentAttempt(PASSWORD);
+    check(
+      'a correct password is accepted',
+      throttledSuccess.status === 302,
+      `status ${throttledSuccess.status}`,
+    );
+    check(
+      'a correct password does not skip the check queue',
+      throttledSuccess.elapsed > 1500,
+      `${throttledSuccess.elapsed}ms, which would make response time the verdict`,
+    );
+    check('no submission is ever answered with 429', !sawTooManyRequests);
+
+    // That success cleared the counter, so the flows below are not throttled.
+    // Only a correct password clears it; guessing cannot.
+    const afterSuccess = await consentAttempt(PASSWORD);
     check(
       'a correct password is prompt once the counter is cleared',
-      afterRescue.status === 302 && afterRescue.elapsed < 1500,
-      `status ${afterRescue.status} in ${afterRescue.elapsed}ms`,
+      afterSuccess.status === 302 && afterSuccess.elapsed < 1000,
+      `status ${afterSuccess.status} in ${afterSuccess.elapsed}ms`,
     );
 
     // --- PKCE is actually enforced ---------------------------------------

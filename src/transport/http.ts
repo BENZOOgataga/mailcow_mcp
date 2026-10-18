@@ -49,31 +49,38 @@ export interface HttpTransportOptions {
   maxBodyBytes?: number;
 }
 
-/** Base delay applied to a rejected authorization, doubling per failure. */
-const CONSENT_BASE_DELAY_MS = 1000;
-/** Ceiling on that delay, so a held socket is bounded. */
-const CONSENT_MAX_DELAY_MS = 30_000;
-/** Failures stop counting towards the delay once the window has passed. */
+/** Minimum spacing between two password checks, doubling per failure. */
+const CONSENT_BASE_INTERVAL_MS = 1000;
+/** Ceiling on that spacing. */
+const CONSENT_MAX_INTERVAL_MS = 30_000;
+/** Failures stop counting towards the interval once the window has passed. */
 const CONSENT_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 /**
- * How many rejected authorizations may be waiting out their delay at once.
+ * How many submissions may be waiting for their turn to be checked.
  *
- * Beyond this the route drops the connection rather than queueing, because the
- * delay holds a socket open and an attacker would otherwise exhaust them. A
- * correct password is answered before this budget is consulted.
+ * Past this the route sheds, and it sheds *before* looking at the password, so
+ * the decision cannot depend on whether the password was right.
  */
-const CONSENT_MAX_INFLIGHT = 16;
+const CONSENT_MAX_QUEUE = 8;
 
 /**
- * Delay before answering a rejected authorization, by failure count.
+ * Minimum interval between password checks, by failure count in the window.
+ *
+ * This gates how often a guess is *evaluated*, which is the only thing that
+ * actually limits guessing. An earlier version used the same schedule to delay
+ * the *reply* instead, and that is worth spelling out because it looked
+ * equivalent and was not: an attacker does not need the reply, only the
+ * verdict. They would saturate the route, every guess would still be evaluated
+ * at full speed, a wrong one had its socket dropped at once and a right one
+ * returned an immediate redirect. The delay slowed nobody and the saturation
+ * path was a clean negative oracle.
  *
  * Exported for the unit test, which is where the schedule is checked: an
- * integration test can only observe it by waiting, and waiting out a 30 second
- * step is not a test anybody runs twice.
+ * integration test can only observe it by waiting.
  */
-export function consentDelayFor(failures: number): number {
+export function consentIntervalFor(failures: number): number {
   const exponent = Math.min(Math.max(failures, 1) - 1, 10);
-  return Math.min(CONSENT_BASE_DELAY_MS * 2 ** exponent, CONSENT_MAX_DELAY_MS);
+  return Math.min(CONSENT_BASE_INTERVAL_MS * 2 ** exponent, CONSENT_MAX_INTERVAL_MS);
 }
 
 interface McpSession {
@@ -128,7 +135,10 @@ export class HttpTransportHost {
     */
   private consentFailures = 0;
   private consentWindowStartedAt = 0;
-  private consentInflight = 0;
+  /** Submissions waiting for, or currently holding, the check slot. */
+  private consentQueueDepth = 0;
+  /** Earliest time the next password check may run. */
+  private consentNextSlotAt = 0;
 
   constructor(
     private readonly createMcpServer: McpServerFactory,
@@ -179,54 +189,7 @@ export class HttpTransportHost {
     // refusal: a wrong answer gets slower, but a correct one is never refused,
     // so there is nothing for an attacker to trip.
     this.app.post(CONSENT_SUBMIT_PATH, (req: Request, res: Response) => {
-      const { pending, password } = req.body ?? {};
-      if (typeof pending !== 'string' || typeof password !== 'string') {
-        res.status(400).type('text/plain').send('Malformed authorization request');
-        return;
-      }
-
-      // The password is checked before any throttling decision, and that
-      // ordering is the whole defence against locking the operator out.
-      // Nothing on the failure path below, neither the delay nor the
-      // concurrency budget, can reach a submission carrying the right
-      // password. An earlier version consulted the budget first, which let an
-      // attacker holding failures open answer the operator's own correct
-      // submission with a 503: the lockout this route exists to avoid.
-      const redirectTo = provider.completeAuthorization(pending, password);
-
-      if (redirectTo) {
-        // Only a correct password clears the counter. A guessing run cannot.
-        this.consentFailures = 0;
-        logger.info('Authorization granted', { ip: req.ip });
-        res.redirect(302, redirectTo);
-        return;
-      }
-
-      // Identical for a bad password, a tampered blob and an expired consent
-      // page, and slow enough to make online guessing unattractive.
-      const delay = this.registerConsentFailure();
-      logger.warn('Authorization attempt rejected', {
-        ip: req.ip,
-        failures: this.consentFailures,
-        delayMs: delay,
-      });
-
-      if (this.consentInflight >= CONSENT_MAX_INFLIGHT) {
-        // The budget for held sockets is spent. Drop this connection rather
-        // than hold it, which exhausts sockets, or answer it at once, which
-        // would let an attacker strip the delay by saturating the route and
-        // turn it into a fast oracle. The failure is still counted above.
-        req.socket.destroy();
-        return;
-      }
-
-      this.consentInflight += 1;
-      setTimeout(() => {
-        this.consentInflight -= 1;
-        if (!res.headersSent) {
-          res.status(401).type('text/plain').send('Authorization failed');
-        }
-      }, delay);
+      void this.handleConsentSubmission(req, res);
     });
 
     // --- OAuth 2.1 -------------------------------------------------------
@@ -304,27 +267,109 @@ export class HttpTransportHost {
   }
 
   /**
-   * Record a failed authorization and return how long to wait before replying.
+   * Handle a consent submission under a global check-rate limit.
    *
-   * Throttling is by delay rather than refusal, and that is the point. The SDK
-   * limiter this route used to inherit answered 429, so an attacker who tripped
-   * it locked the operator out of their own consent screen; behind a proxy with
-   * `trust proxy` off, every request shared one counter and tripping it was
-   * trivial. A wrong answer here gets slower and a correct one is never
-   * refused, so there is nothing for an attacker to trip.
+   * Three properties, each of which replaces a mistake made here before:
    *
-   * The cost of a global counter is that an attack can slow the operator's own
-   * *mistyped* attempts. It cannot slow a correct one, which is checked before
-   * any of this runs.
+   *   1. The throttle limits how often a password is *checked*, not how long
+   *      the answer takes. Delaying the answer leaves the check running at
+   *      full speed, and the verdict is what an attacker is after.
+   *   2. Shedding happens before the check and on a condition that has nothing
+   *      to do with the password, so a shed cannot be read as "wrong".
+   *   3. A correct password waits its turn like any other. Letting it skip the
+   *      queue is what turned saturation into a fast negative oracle: drops
+   *      meant wrong, an immediate redirect meant right.
+   *
+   * The cost is that a sustained attack can delay, and past the queue bound
+   * refuse, the operator's own submissions. There is no way to avoid that on an
+   * endpoint that cannot tell the operator from anyone else: `/authorize` needs
+   * no authentication and registration is open, so any token this route could
+   * hand the operator, an attacker can request too. The controls that do
+   * distinguish them live in front of this process (a source allowlist on the
+   * proxy) and in the password's entropy, not here.
    */
-  private registerConsentFailure(): number {
+  private async handleConsentSubmission(req: Request, res: Response): Promise<void> {
+    const { provider, logger } = this.options;
+    const { pending, password } = req.body ?? {};
+    if (typeof pending !== 'string' || typeof password !== 'string') {
+      res.status(400).type('text/plain').send('Malformed authorization request');
+      return;
+    }
+
+    if (this.consentQueueDepth >= CONSENT_MAX_QUEUE) {
+      logger.warn('Authorization submission shed; check queue is full', { ip: req.ip });
+      res.status(503).type('text/plain').send('Try again shortly');
+      return;
+    }
+
+    this.consentQueueDepth += 1;
+    try {
+      await this.awaitConsentSlot();
+
+      const redirectTo = provider.completeAuthorization(pending, password);
+
+      if (redirectTo) {
+        // Only a correct password clears the throttle, and guessing cannot
+        // produce one. Clearing the reserved-slot cursor as well as the count
+        // matters: without it, slots already reserved by an attack keep
+        // spacing out the operator's next submissions after they have proven
+        // who they are.
+        this.consentFailures = 0;
+        this.consentNextSlotAt = 0;
+        logger.info('Authorization granted', { ip: req.ip });
+        if (!res.headersSent) res.redirect(302, redirectTo);
+        return;
+      }
+
+      // Identical for a bad password, a tampered blob and an expired consent
+      // page. The caller does not learn which.
+      this.registerConsentFailure();
+      logger.warn('Authorization attempt rejected', {
+        ip: req.ip,
+        failures: this.consentFailures,
+      });
+      if (!res.headersSent) {
+        res.status(401).type('text/plain').send('Authorization failed');
+      }
+    } finally {
+      this.consentQueueDepth -= 1;
+    }
+  }
+
+  /**
+   * Wait until this submission's turn to be checked.
+   *
+   * Reserves the next slot before waiting, so concurrent submissions queue
+   * behind one another instead of all being checked at once. The spacing is
+   * taken from the failure count, which is global for the window because any
+   * per-caller key is resettable: `/authorize` is unauthenticated and
+   * registration is open, so a fresh consent page per guess resets anything
+   * keyed to the page.
+   */
+  private async awaitConsentSlot(): Promise<void> {
+    const now = Date.now();
+    if (now - this.consentWindowStartedAt > CONSENT_FAILURE_WINDOW_MS) {
+      this.consentWindowStartedAt = now;
+      this.consentFailures = 0;
+      this.consentNextSlotAt = 0;
+    }
+
+    const slot = Math.max(now, this.consentNextSlotAt);
+    this.consentNextSlotAt = slot + consentIntervalFor(this.consentFailures + 1);
+
+    const wait = slot - now;
+    if (wait > 0) {
+      await new Promise<void>((resolve) => setTimeout(resolve, wait));
+    }
+  }
+
+  private registerConsentFailure(): void {
     const now = Date.now();
     if (now - this.consentWindowStartedAt > CONSENT_FAILURE_WINDOW_MS) {
       this.consentWindowStartedAt = now;
       this.consentFailures = 0;
     }
     this.consentFailures += 1;
-    return consentDelayFor(this.consentFailures);
   }
 
   /** Exposed for tests: failed authorizations counted in the current window. */

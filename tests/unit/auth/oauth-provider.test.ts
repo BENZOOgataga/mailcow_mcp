@@ -354,7 +354,7 @@ describe('MailcowOAuthProvider', () => {
             operatorPassword: 'short',
             issuerUrl: new URL('https://mcp.example.com'),
           }),
-      ).toThrow(/12 characters/);
+      ).toThrow(/24 characters/);
     });
   });
 });

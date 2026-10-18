@@ -195,10 +195,17 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
   private readonly blobKey = randomBytes(32);
 
   constructor(private readonly options: MailcowOAuthOptions) {
-    if (!options.operatorPassword || options.operatorPassword.length < 12) {
+    // The consent route can throttle how often a guess is checked, but it
+    // cannot tell the operator from an attacker: /authorize needs no
+    // authentication and registration is open. Entropy is therefore the
+    // control that actually bounds guessing, so the floor is set where a
+    // throttled online attack is hopeless rather than merely slow.
+    if (!options.operatorPassword || options.operatorPassword.length < 24) {
       throw new Error(
-        'MCP_OAUTH_PASSWORD must be set to at least 12 characters. ' +
-          'This is the only credential protecting write access to your mail server.',
+        'MCP_OAUTH_PASSWORD must be set to at least 24 characters, and should be ' +
+          'random rather than memorable. It is the only credential protecting ' +
+          'write access to your mail server, on an endpoint that cannot tell you ' +
+          'apart from anyone else who can reach it.',
       );
     }
     this.scopes = options.scopesSupported ?? [...SUPPORTED_SCOPES];
