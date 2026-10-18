@@ -34,15 +34,46 @@ hand-rolled.
 ### What the OAuth layer is, and is not
 
 It authenticates **the operator** to **this server**. One password, set in
-`MCP_OAUTH_PASSWORD`, and every issued token carries the same authority.
+`MCP_OAUTH_PASSWORD`.
 
 It is **not** an identity provider. There are no users, no roles, and no
 per-person audit trail. If you need several people with different permissions,
-put a real IdP in front and swap in the SDK's `ProxyOAuthServerProvider` — the
+put a real IdP in front and swap in the SDK's `ProxyOAuthServerProvider`. The
 transport does not care which provider it is handed.
 
 Tokens live in memory. A restart invalidates them and the client re-authorizes,
 which is one click. That is a deliberate trade: no bearer tokens on disk.
+
+### Grants, scope and lifetime
+
+Each authorization creates a **grant**, and the access token and refresh token
+both belong to it. Three consequences worth knowing before you deploy:
+
+- **Revoking either token revokes the whole grant.** Revoking only the access
+  token would leave the refresh token able to mint a replacement, so
+  revocation has to reach the grant to mean anything (RFC 7009 section 2.1).
+- **A grant expires 30 days after the operator approved it.** Refresh rotation
+  issues new tokens but never moves that deadline, so a leaked refresh token
+  ages out instead of lasting until the process restarts. After 30 days the
+  client sends you through the consent screen again.
+- **An MCP session is bound to its grant.** A session id travels in a plain
+  header and is a capability on its own, so a token from a different
+  authorization cannot attach to a session it did not open. The mismatch
+  answers 404 rather than 403, so a caller does not learn the session exists.
+
+Two scopes are defined, `mailcow:read` and `mailcow:write`, and they are
+enforced per tool rather than at the MCP endpoint: a client holding only
+`mailcow:read` connects normally and is refused the write tools. A refresh may
+narrow its scope and never widen it. A client that requests no scope is granted
+both, which is what Claude's registration does.
+
+Scope is a second, independent gate from the exposure flags below. The flags
+decide which tools exist for a deployment at all; scope decides which of those
+a given token may call. A read-only mailcow API key is a third, and the only
+one that holds no matter what this server is persuaded to do.
+
+Over stdio there is no token, so none of this applies: the caller is the user
+who launched the process.
 
 ---
 
@@ -226,6 +257,15 @@ cases that matter:
 - a token exchange with a mismatched PKCE verifier fails
 - an authorization code cannot be replayed
 - a consumed refresh token stops working
+- two clients can be connected at once, and both serve requests
+- a token from one grant cannot drive another grant's session, on either the
+  POST endpoint or the event stream
+- a read-only token is refused a write tool and allowed a read tool
+- a refresh cannot widen its own scope
+- revoking an access token also kills its refresh token
+- a malformed or oversized body returns no stack trace
+- the consent route never answers 429, and still accepts the correct password
+  after repeated failures
 
 ```bash
 npm run build && node tests/integration/http-oauth.test.js

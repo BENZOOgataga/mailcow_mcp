@@ -47,6 +47,10 @@ an **OAuth 2.1** authorization server (authorization code + PKCE, dynamic
 client registration, refresh and revocation), because neither client can send a
 static bearer header.
 
+Each MCP session gets its own protocol object, so several clients can be
+connected at the same time. Sessions are bound to the grant that opened them,
+and the two scopes (`mailcow:read`, `mailcow:write`) are enforced per tool.
+
 ```bash
 MCP_TRANSPORT=http
 MCP_HTTP_HOST=127.0.0.1
