@@ -914,6 +914,53 @@ async function main() {
       `status ${afterSuccess.status} in ${afterSuccess.elapsed}ms`,
     );
 
+    // A success must not hand out free guesses to whatever is queued behind it.
+    //
+    // Clearing the throttle on success has to skip the remaining interval of
+    // the one link holding the chain, and nothing else. An earlier version
+    // released every pending link, including submissions whose turn had not
+    // come: their holds resolved early, so the whole queue behind the
+    // operator's success was then checked back to back with no spacing. The
+    // operator's own correct password was what handed out the burst.
+    const correctFirst = newGrantBlob(client.client_id).then((blob) =>
+      fetch(`${BASE}/authorize/consent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ pending: blob, password: PASSWORD }),
+        redirect: 'manual',
+      }).catch(() => null),
+    );
+    await new Promise((r) => setTimeout(r, 120));
+
+    const behind = [];
+    for (let i = 0; i < 5; i++) {
+      const blob = await newGrantBlob(client.client_id);
+      behind.push(
+        fetch(`${BASE}/authorize/consent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ pending: blob, password: `behind-${i}` }),
+          redirect: 'manual',
+        }).catch(() => null),
+      );
+    }
+
+    const behindStarted = Date.now();
+    await correctFirst;
+    const behindResults = await Promise.all(behind);
+    const behindElapsed = Date.now() - behindStarted;
+
+    check(
+      'guesses queued behind a success are still rejected',
+      behindResults.every((r) => r === null || r.status === 401 || r.status === 503),
+      behindResults.map((r) => (r ? r.status : 'err')).join(','),
+    );
+    check(
+      'and they keep their spacing rather than being released by it',
+      behindElapsed > 2500,
+      `five queued guesses resolved in ${behindElapsed}ms, which would mean the success released their holds`,
+    );
+
     // --- unknown routes -------------------------------------------------------
     const notFound = await fetch(`${BASE}/../etc/passwd`);
     check('unknown routes 404 rather than leaking', notFound.status === 404 || notFound.status === 400, `status ${notFound.status}`);

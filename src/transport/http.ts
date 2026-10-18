@@ -200,11 +200,19 @@ export class HttpTransportHost {
    * interval, and nothing to get arithmetically wrong.
    */
   private consentChain: Promise<void> = Promise.resolve();
-  /** Links held open on the chain, so shutdown can settle them. */
-  private readonly pendingConsentWaits = new Set<{
-    timer: NodeJS.Timeout | undefined;
-    settle: () => void;
-  }>();
+  /**
+   * The submission currently holding the chain open for its interval.
+   *
+   * Kept apart from the waiters below, and that separation is the point. A
+   * successful authorization should skip the *remaining* interval, which means
+   * releasing this one link. Releasing the waiters as well, which an earlier
+   * version did, resolves their holds before their turn has come, so every
+   * queued guess is then checked back to back with no spacing: a burst of free
+   * attempts handed out by the operator's own success.
+   */
+  private consentHolder?: { timer: NodeJS.Timeout; release: () => void };
+  /** Submissions waiting for their turn, so shutdown can let them go. */
+  private readonly consentWaiters = new Set<{ abandon: (reason: 'shutdown') => void }>();
   private sessionSweeper?: NodeJS.Timeout;
 
   constructor(
@@ -414,14 +422,21 @@ export class HttpTransportHost {
     }
 
     this.consentQueueDepth += 1;
-    let waited: boolean;
+    let outcome: 'ok' | 'gone' | 'shutdown';
     try {
-      waited = await this.awaitConsentSlot(req);
+      outcome = await this.awaitConsentSlot(req);
     } finally {
       this.consentQueueDepth -= 1;
     }
-    if (!waited) {
-      // The caller gave up while waiting. Nothing to answer.
+    if (outcome === 'gone') {
+      // The caller hung up while waiting. Nothing to answer.
+      return;
+    }
+    if (outcome === 'shutdown') {
+      // Never checked, so this says nothing about the password.
+      if (!res.headersSent) {
+        res.status(503).type('text/plain').send('Server is shutting down');
+      }
       return;
     }
 
@@ -429,13 +444,18 @@ export class HttpTransportHost {
 
     if (redirectTo) {
       // Only a correct password clears the throttle, and guessing cannot
-      // produce one. Releasing the links already held matters as much as
-      // zeroing the count: an interval is fixed when its link is scheduled, so
-      // without this the operator still queues behind thirty-second holds
-      // reserved by a guessing run that has just been proven irrelevant.
+      // produce one. Skipping the *remaining* interval matters as much as
+      // zeroing the count, because an interval is fixed when its link is
+      // scheduled: without this the operator queues behind a thirty-second
+      // hold reserved by a guessing run that has just been proven irrelevant.
+      //
+      // Only the link currently holding the chain is released. Releasing the
+      // waiters too would resolve their holds before their turn had come, so
+      // every queued guess would then be checked back to back with no
+      // spacing, which is a burst of free attempts handed out by this very
+      // success.
       this.consentFailures = 0;
-      for (const waiting of [...this.pendingConsentWaits]) waiting.settle();
-      this.pendingConsentWaits.clear();
+      this.consentHolder?.release();
       logger.info('Authorization granted', { ip: req.ip });
       if (!res.headersSent) res.redirect(302, redirectTo);
       return;
@@ -456,18 +476,18 @@ export class HttpTransportHost {
   /**
    * Wait until this submission's turn to be checked.
    *
-   * Returns false if the caller disconnected while waiting, in which case it
+   * Returns why it stopped waiting. A caller that disconnects, or a shutdown,
    * gives up its place immediately rather than making the next submission wait
    * out an interval for a request nobody is listening to. That is what stops a
-   * run of aborted POSTs, which cost an attacker nothing, from delaying the
-   * operator.
+   * run of aborted POSTs, which cost an attacker nothing, from filling the
+   * queue and having every later submission refused.
    *
    * The spacing comes from the failure count, which is global for the window
    * because any per-caller key is resettable: `/authorize` is unauthenticated
    * and registration is open, so a fresh consent page per guess resets
    * anything keyed to the page.
    */
-  private async awaitConsentSlot(req: Request): Promise<boolean> {
+  private async awaitConsentSlot(req: Request): Promise<'ok' | 'gone' | 'shutdown'> {
     const now = Date.now();
     if (now - this.consentWindowStartedAt > CONSENT_FAILURE_WINDOW_MS) {
       this.consentWindowStartedAt = now;
@@ -484,52 +504,55 @@ export class HttpTransportHost {
     // than all reading the same tail.
     this.consentChain = ahead.then(() => held);
 
-    const entry = { timer: undefined as NodeJS.Timeout | undefined, settle: release };
-    this.pendingConsentWaits.add(entry);
-
-    // Raced against the wait, not checked after it. A submission that hangs up
-    // has to leave the queue immediately: parked until its turn came, it went
-    // on occupying a queue slot for the whole time everything ahead of it was
-    // being spaced out, which kept the queue full and had every later
-    // submission refused. That is the lockout, one layer further in.
-    let abandon!: () => void;
-    const abandoned = new Promise<'gone'>((resolve) => {
-      abandon = () => resolve('gone');
+    // Raced against the wait, not checked after it. A submission parked until
+    // its turn came went on occupying a queue slot for the whole time the
+    // submissions ahead of it were being spaced out, which kept the queue at
+    // its bound and had every later submission refused.
+    let abandon!: (reason: 'gone' | 'shutdown') => void;
+    const abandoned = new Promise<'gone' | 'shutdown'>((resolve) => {
+      abandon = resolve;
     });
+    const waiter = { abandon: (reason: 'shutdown'): void => abandon(reason) };
+    this.consentWaiters.add(waiter);
+
+    const onGone = (): void => abandon('gone');
     const res = req.res;
     const onClose = (): void => {
-      if (!res || !res.writableEnded) abandon();
+      if (!res || !res.writableEnded) abandon('gone');
     };
-    req.on('aborted', abandon);
+    req.on('aborted', onGone);
     res?.on('close', onClose);
 
     try {
-      const outcome = await Promise.race([ahead.then(() => 'turn' as const), abandoned]);
+      const outcome = await Promise.race([ahead.then(() => 'ok' as const), abandoned]);
 
-      if (outcome === 'gone') {
+      if (outcome !== 'ok') {
         // Release at once, so this submission costs the next one nothing. The
         // chain still runs through this link; it simply holds no interval.
-        this.pendingConsentWaits.delete(entry);
         release();
-        return false;
+        return outcome;
       }
 
       // Hold the chain for one interval, so the next check is spaced from this
       // one. The check itself happens in the caller, immediately after this
       // returns.
       const interval = consentIntervalFor(this.consentFailures + 1);
-      entry.timer = setTimeout((): void => {
-        this.pendingConsentWaits.delete(entry);
-        release();
-      }, interval);
-      entry.settle = (): void => {
-        if (entry.timer) clearTimeout(entry.timer);
-        this.pendingConsentWaits.delete(entry);
-        release();
+      const holder = {
+        timer: setTimeout(() => {
+          if (this.consentHolder === holder) this.consentHolder = undefined;
+          release();
+        }, interval),
+        release: (): void => {
+          clearTimeout(holder.timer);
+          if (this.consentHolder === holder) this.consentHolder = undefined;
+          release();
+        },
       };
-      return true;
+      this.consentHolder = holder;
+      return 'ok';
     } finally {
-      req.off('aborted', abandon);
+      this.consentWaiters.delete(waiter);
+      req.off('aborted', onGone);
       res?.off('close', onClose);
     }
   }
@@ -796,12 +819,17 @@ export class HttpTransportHost {
       this.sessionSweeper = undefined;
     }
 
-    // Settle anything holding the chain first. `httpServer.close()` waits for
-    // in-flight requests, and a submission parked on a 30 second interval is
-    // in-flight, so without this a graceful shutdown stalled for minutes and
-    // ended in a SIGKILL.
-    for (const entry of [...this.pendingConsentWaits]) entry.settle();
-    this.pendingConsentWaits.clear();
+    // Let go of the chain first. `httpServer.close()` waits for in-flight
+    // requests, and a submission parked on a 30 second interval is in-flight,
+    // so without this a graceful shutdown stalled for minutes and ended in a
+    // SIGKILL.
+    //
+    // Waiters are abandoned rather than released: releasing them would send
+    // them on to be checked during shutdown, which is not what anyone wants
+    // from a stop(). They answer 503 without their password being read.
+    this.consentHolder?.release();
+    for (const waiter of [...this.consentWaiters]) waiter.abandon('shutdown');
+    this.consentWaiters.clear();
 
     const sessions = [...this.sessions.values()];
     this.sessions.clear();
