@@ -341,6 +341,55 @@ async function main() {
     const firstFailure = await consentAttempt('wrong-one');
     check('a wrong password is rejected', firstFailure.status === 401, `status ${firstFailure.status}`);
 
+    // Overflow past the queue bound must be refused WITHOUT a verdict.
+    //
+    // The version this replaces checked a submission immediately once the
+    // queue had grown past a time ceiling, which reads like graceful
+    // degradation and was a total bypass: a skipping submission never advances
+    // the cursor, so after one flood pushed it past the ceiling, every later
+    // guess was checked at once with no spacing at all. The bound it was meant
+    // to soften stopped existing.
+    //
+    // What should happen instead: the submissions that fit the queue wait
+    // their turn, and the rest get a 503 decided on depth alone, before the
+    // password is read. So within a few hundred milliseconds the only
+    // responses seen should be refusals, never a 401 or a 302, because
+    // answering either of those quickly is the verdict leaking.
+    const overflowControllers = [];
+    const overflowStatuses = [];
+    for (let i = 0; i < 14; i++) {
+      const blob = await newGrantBlob(client.client_id);
+      const controller = new AbortController();
+      overflowControllers.push(controller);
+      void fetch(`${BASE}/authorize/consent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ pending: blob, password: `overflow-${i}` }),
+        redirect: 'manual',
+        signal: controller.signal,
+      })
+        .then((r) => overflowStatuses.push(r.status))
+        .catch(() => {});
+    }
+    await new Promise((r) => setTimeout(r, 700));
+
+    const fastVerdicts = overflowStatuses.filter((s) => s === 401 || s === 302);
+    check(
+      'overflow submissions are refused rather than checked',
+      overflowStatuses.includes(503),
+      `statuses seen within 700ms: ${overflowStatuses.join(',') || '(none)'}`,
+    );
+    check(
+      'no submission is given a verdict ahead of its slot',
+      fastVerdicts.length === 0,
+      `${fastVerdicts.length} verdict(s) returned early: ${fastVerdicts.join(',')}`,
+    );
+
+    // Release the queued ones so the rest of the suite is not waiting behind
+    // them; the slots are handed back on disconnect.
+    for (const controller of overflowControllers) controller.abort();
+    await new Promise((r) => setTimeout(r, 400));
+
     // The guarantee is a bound on how often a guess is *checked*, server-wide,
     // whatever concurrency the attacker brings. Four guesses fired at once,
     // each with its own freshly rendered consent page, must therefore take

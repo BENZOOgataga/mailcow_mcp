@@ -93,15 +93,20 @@ const CONSENT_MAX_INTERVAL_MS = 30_000;
 /** Failures stop counting towards the interval once the window has passed. */
 const CONSENT_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 /**
- * Longest a submission will be held waiting for its check slot.
+ * How many submissions may be waiting for a check slot.
  *
- * Past this the submission is checked immediately rather than refused. That
- * weakens the rate bound under heavy concurrency and is the deliberate trade:
- * refusing is what locked the operator out, and an attacker who floods to get
- * past this still has to hold a connection per attempt, which the proxy is
- * where you bound.
+ * Past this a submission is refused without its password being read. That is
+ * an availability trade, and it is deliberate this time rather than
+ * accidental: see the note on handleConsentSubmission.
+ *
+ * The alternative that was tried and must not come back: checking immediately
+ * once the queue grew past a time ceiling. That reads like a graceful
+ * degradation and is a complete bypass. Submissions that skip the queue do not
+ * advance the cursor either, so once an attacker pushes it past the ceiling,
+ * every subsequent guess is checked at once, concurrently, with no spacing at
+ * all. It removed the bound it was meant to soften.
  */
-const CONSENT_MAX_WAIT_MS = 60_000;
+const CONSENT_MAX_QUEUE = 8;
 
 /** Idle MCP sessions are closed after this long without a request. */
 const SESSION_IDLE_MS = 30 * 60 * 1000;
@@ -178,6 +183,8 @@ export class HttpTransportHost {
   private consentNextSlotAt = 0;
   /** Counter identifying the most recent slot reservation. */
   private consentReservationSeq = 0;
+  /** Submissions waiting for, or holding, the check slot. */
+  private consentQueueDepth = 0;
   /** Timers for submissions waiting on a slot, so shutdown can settle them. */
   private readonly pendingConsentWaits = new Set<{
     timer: NodeJS.Timeout;
@@ -354,12 +361,18 @@ export class HttpTransportHost {
    *   1. The throttle limits how often a password is *checked*, not how long
    *      the answer takes. Delaying only the answer leaves the check running at
    *      full speed, and the verdict is what an attacker is after.
-   *   2. Nobody is refused. An earlier version shed over-budget submissions
-   *      with a 503 before reading the password. Password-independent, so not
-   *      an oracle, but eight *aborted* POSTs cost an attacker nothing and
-   *      answered the operator's correct password with a 503 in two
-   *      milliseconds. Past the wait ceiling a submission is checked
-   *      immediately instead.
+   *   2. A submission past the queue bound is refused, and the refusal is
+   *      decided on queue depth alone, before the password is read, so it
+   *      cannot be read as a verdict. This is an availability trade and it is
+   *      the honest one: the two alternatives both failed. Checking
+   *      immediately past a time ceiling removed the bound entirely, because
+   *      skipping submissions never advance the cursor, so one flood made
+   *      every later guess free. Holding every submission regardless of depth
+   *      makes the queue itself the resource to exhaust. What makes the
+   *      refusal acceptable now is property 4: a caller that hangs up gives
+   *      its slot back, so filling this queue costs an attacker a held
+   *      connection per slot rather than an aborted request. Bound those at
+   *      the proxy, and restrict the operator-facing paths there too.
    *   3. A correct password waits its turn like any other. Letting it skip the
    *      queue is what turned saturation into a fast negative oracle.
    *   4. A caller that disconnects releases its slot. Without that, a slot was
@@ -374,7 +387,24 @@ export class HttpTransportHost {
       return;
     }
 
-    const waited = await this.awaitConsentSlot(req);
+    if (this.consentQueueDepth >= CONSENT_MAX_QUEUE) {
+      // Decided on depth alone. The password has not been looked at, so this
+      // response carries no information about it.
+      logger.warn('Authorization submission refused; check queue is full', {
+        ip: req.ip,
+        queued: this.consentQueueDepth,
+      });
+      res.status(503).type('text/plain').send('Try again shortly');
+      return;
+    }
+
+    this.consentQueueDepth += 1;
+    let waited: boolean;
+    try {
+      waited = await this.awaitConsentSlot(req);
+    } finally {
+      this.consentQueueDepth -= 1;
+    }
     if (!waited) {
       // The caller gave up while waiting. Nothing to answer.
       return;
@@ -426,19 +456,13 @@ export class HttpTransportHost {
     }
 
     const slot = Math.max(now, this.consentNextSlotAt);
-    let wait = slot - now;
-    let seq = 0;
+    const wait = slot - now;
 
-    // Check immediately rather than refuse, past the ceiling. See property 2.
-    // This also caps how far ahead the cursor can be pushed, so the longest an
-    // attacker can make the operator wait is bounded even before the rollback
-    // below.
-    if (wait > CONSENT_MAX_WAIT_MS) {
-      wait = 0;
-    } else {
-      this.consentNextSlotAt = slot + consentIntervalFor(this.consentFailures + 1);
-      seq = ++this.consentReservationSeq;
-    }
+    // Always reserve, and always wait for the reservation. There is no path
+    // here that checks a password ahead of its slot: that is what makes the
+    // spacing a bound on guessing rather than on latency.
+    this.consentNextSlotAt = slot + consentIntervalFor(this.consentFailures + 1);
+    const seq = ++this.consentReservationSeq;
 
     if (wait <= 0) return true;
 
@@ -503,6 +527,11 @@ export class HttpTransportHost {
   /** Exposed for tests: failed authorizations counted in the current window. */
   get consentFailureCount(): number {
     return this.consentFailures;
+  }
+
+  /** Exposed for tests: submissions currently waiting for a check slot. */
+  get consentQueueLength(): number {
+    return this.consentQueueDepth;
   }
 
   /**

@@ -212,7 +212,80 @@ the same origin as `MCP_PUBLIC_URL`, so proxy those paths too.
 Set `MCP_TRUST_PROXY=true` only once the proxy is in place. Until then a direct
 caller can forge `X-Forwarded-For` and poison your logs.
 
-### 2. Anthropic publishes stable egress addresses
+### 2. Two allowlists, not one
+
+The endpoints here are reached by two different parties, and that split is the
+only place a source allowlist can do real work.
+
+| Reached by the operator's **browser** | Reached by the vendor's **backend** |
+|---|---|
+| `GET /authorize` (the consent screen) | `POST /token` |
+| `POST /authorize/consent` | `POST /register` |
+| | `POST /revoke` |
+| | `POST/GET/DELETE /mcp` |
+| | the two `.well-known` documents |
+
+The consent flow is a browser redirect: Claude or ChatGPT sends *you* to
+`/authorize`, you type the operator password, and the code goes back to the
+vendor. So the vendor's published egress ranges are the wrong allowlist for
+`/authorize` — restrict that path to the vendor and you will never be able to
+authorize anything, because your own browser is not in it.
+
+Splitting them is also what makes the throttle discussion above moot. Nothing
+inside the process can tell you from an attacker; nginx can, because it sees a
+source address:
+
+```nginx
+# The operator's own path. Restrict it to wherever you actually authorize from:
+# a VPN range, an office prefix, a bastion. This is the control that makes the
+# consent route's throttling a second line rather than the only one.
+location ^~ /authorize {
+    allow 203.0.113.0/24;   # your network, not the vendor's
+    deny  all;
+
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+
+# Everything the vendor's infrastructure calls.
+location / {
+    allow 160.79.104.0/21;                          # Anthropic, published and stable
+    include /etc/nginx/snippets/openai-egress.conf; # see below, if you need ChatGPT
+    deny  all;
+
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+
+    # Streamable HTTP keeps a response open for server-sent events.
+    proxy_buffering off;
+    proxy_cache off;
+    proxy_read_timeout 3600s;
+
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+`location ^~ /authorize` wins over the prefix `location /` for both
+`/authorize` and `/authorize/consent`, which is what you want: one rule covers
+the whole operator path.
+
+If you authorize from a dynamic address, the honest options are a VPN, a
+bastion you can allowlist, or opening `/authorize` only while you add the
+connector and closing it again afterwards. Leaving it open to the internet is
+also a choice; it is the one the in-process throttle exists for, and it is
+weaker than any of the three above.
+
+Set `MCP_TRUST_PROXY=true` once this is in place, so the server sees the real
+client address rather than the proxy's.
+
+### 3. Anthropic publishes stable egress addresses
 
 `160.79.104.0/21`. Restricting the vhost to it is cheap defence in depth:
 
@@ -229,7 +302,7 @@ schedule and regenerate the allowlist, or drop IP filtering and rely on OAuth.
 OpenAI states plainly that an IP allowlist identifies their network, not a
 user, and does not replace authentication.
 
-### 3. Container
+### 4. Container
 
 A `Dockerfile` and `docker-compose.yml` are included. The compose file publishes
 to loopback by default; change the bind if your proxy is on another host, and
@@ -238,7 +311,7 @@ mailcow's own `dockerapi` container does, and copying that pattern into an
 internet-reachable service would hand socket access — and therefore root — to
 anything that compromises it.
 
-### 4. Add the connector
+### 5. Add the connector
 
 In Claude: Settings → Connectors → Add custom connector, with the URL from
 `MCP_PUBLIC_URL`. Claude registers itself via dynamic client registration, then

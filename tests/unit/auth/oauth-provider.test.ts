@@ -616,6 +616,33 @@ describe('MailcowOAuthProvider', () => {
       });
     });
 
+    it('keeps a seeded client even after its last grant is revoked', async () => {
+      const provider = makeProvider();
+      // A client the operator configured, rather than one registered over the
+      // network. ChatGPT is given credentials this way.
+      provider.seedClient({ ...CLIENT } as OAuthClientInformationFull);
+
+      const tokens = await issueGrant(provider);
+      await provider.revokeToken(CLIENT, { token: tokens.access_token });
+      expect(provider.grantCount).toBe(0);
+
+      // Revoking the last grant used to remove the only protection a seeded
+      // client had, which left the operator's configured client evictable by
+      // unauthenticated registration traffic: it silently disappears and the
+      // vendor can no longer authenticate.
+      for (let i = 0; i < 150; i++) {
+        await provider.clientsStore.registerClient!({
+          client_id: `churn-${i}`,
+          client_name: `churn ${i}`,
+          redirect_uris: [REDIRECT],
+        } as OAuthClientInformationFull);
+      }
+
+      await expect(provider.clientsStore.getClient(CLIENT.client_id)).resolves.toMatchObject({
+        client_id: CLIENT.client_id,
+      });
+    });
+
     it('drops unbounded fields it never reads', async () => {
       const provider = makeProvider();
       const registered = await provider.clientsStore.registerClient!({

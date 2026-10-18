@@ -249,7 +249,18 @@ function sanitizeClient(client: OAuthClientInformationFull): OAuthClientInformat
  */
 class InMemoryClientsStore implements OAuthRegisteredClientsStore {
   private clients = new Map<string, OAuthClientInformationFull>();
+  /** Clients protected while they hold a grant. */
   private pinned = new Set<string>();
+  /**
+   * Clients configured by the operator rather than registered over the
+   * network. Permanently protected.
+   *
+   * Kept separate from `pinned` because unpinning happens when a client's last
+   * grant is revoked, and a seeded client that lost its pin that way would
+   * become evictable by unauthenticated registration traffic: the operator's
+   * configured client silently disappears and the vendor cannot authenticate.
+   */
+  private seeded = new Set<string>();
 
   async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
     const client = this.clients.get(clientId);
@@ -273,7 +284,7 @@ class InMemoryClientsStore implements OAuthRegisteredClientsStore {
   seed(client: OAuthClientInformationFull): void {
     const sanitized = sanitizeClient(client);
     this.clients.set(sanitized.client_id, sanitized);
-    this.pinned.add(sanitized.client_id);
+    this.seeded.add(sanitized.client_id);
   }
 
   /** Protect a client from eviction while it holds a grant. */
@@ -289,7 +300,7 @@ class InMemoryClientsStore implements OAuthRegisteredClientsStore {
     while (this.clients.size >= MAX_CLIENTS) {
       let victim: string | undefined;
       for (const key of this.clients.keys()) {
-        if (!this.pinned.has(key)) {
+        if (!this.pinned.has(key) && !this.seeded.has(key)) {
           victim = key;
           break;
         }
