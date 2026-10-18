@@ -107,6 +107,24 @@ const CONSENT_FAILURE_WINDOW_MS = 15 * 60 * 1000;
  * all. It removed the bound it was meant to soften.
  */
 const CONSENT_MAX_QUEUE = 8;
+/**
+ * How far ahead of now the check cursor may ever sit.
+ *
+ * Without this the cursor runs away. Each admitted submission advances it, and
+ * the rollback on disconnect only applies to the most recent reservation, so an
+ * attacker who keeps the queue cycling and abandons the *oldest* entries pushes
+ * it forward indefinitely. The operator is then not refused, which the rest of
+ * this design is careful about, but waits an unbounded time, which is the same
+ * outcome by a slower route.
+ *
+ * At the cap, submissions that would have been spaced can coincide, so up to
+ * CONSENT_MAX_QUEUE checks may land in one interval instead of one. That is
+ * still a bound (at most eight checks per interval, and each one costs the
+ * attacker a held connection), unlike the time-ceiling escape hatch this
+ * replaced, where skipping submissions stopped advancing the cursor at all and
+ * guessing became free.
+ */
+const CONSENT_MAX_AHEAD_MS = 20_000;
 
 /** Idle MCP sessions are closed after this long without a request. */
 const SESSION_IDLE_MS = 30 * 60 * 1000;
@@ -455,13 +473,18 @@ export class HttpTransportHost {
       this.consentNextSlotAt = 0;
     }
 
-    const slot = Math.max(now, this.consentNextSlotAt);
+    // Clamped, so an abandoned reservation cannot push this out indefinitely.
+    const ceiling = now + CONSENT_MAX_AHEAD_MS;
+    const slot = Math.min(Math.max(now, this.consentNextSlotAt), ceiling);
     const wait = slot - now;
 
     // Always reserve, and always wait for the reservation. There is no path
     // here that checks a password ahead of its slot: that is what makes the
     // spacing a bound on guessing rather than on latency.
-    this.consentNextSlotAt = slot + consentIntervalFor(this.consentFailures + 1);
+    this.consentNextSlotAt = Math.min(
+      slot + consentIntervalFor(this.consentFailures + 1),
+      ceiling + CONSENT_MAX_INTERVAL_MS,
+    );
     const seq = ++this.consentReservationSeq;
 
     if (wait <= 0) return true;
@@ -532,6 +555,16 @@ export class HttpTransportHost {
   /** Exposed for tests: submissions currently waiting for a check slot. */
   get consentQueueLength(): number {
     return this.consentQueueDepth;
+  }
+
+  /**
+   * Exposed for tests: how far ahead of now the check cursor sits, in ms.
+   *
+   * This is the number an attacker tries to inflate, and the one that bounds
+   * how long the operator can be made to wait.
+   */
+  get consentSlotAheadMs(): number {
+    return Math.max(0, this.consentNextSlotAt - Date.now());
   }
 
   /**

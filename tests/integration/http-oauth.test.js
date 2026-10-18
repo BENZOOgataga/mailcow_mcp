@@ -390,6 +390,54 @@ async function main() {
     for (const controller of overflowControllers) controller.abort();
     await new Promise((r) => setTimeout(r, 400));
 
+    // Repeated cycles of abandoned submissions must not grow the wait.
+    //
+    // Each admitted submission advances the check cursor, and the rollback on
+    // disconnect only covers the most recent reservation. So an attacker who
+    // keeps the queue cycling and abandons the oldest entries used to push the
+    // cursor forward without limit. That never refuses the operator, which the
+    // rest of this design is careful about, and makes them wait an unbounded
+    // time instead, which is the same outcome by a slower route. The cursor is
+    // clamped now.
+    for (let round = 0; round < 3; round++) {
+      const cycle = [];
+      for (let i = 0; i < 8; i++) {
+        const blob = await newGrantBlob(client.client_id);
+        const controller = new AbortController();
+        cycle.push(
+          fetch(`${BASE}/authorize/consent`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({ pending: blob, password: `cycle-${round}-${i}` }),
+            redirect: 'manual',
+            signal: controller.signal,
+          }).catch(() => null),
+        );
+        setTimeout(() => controller.abort(), 40);
+      }
+      await Promise.allSettled(cycle);
+    }
+
+    const boundedBlob = await newGrantBlob(client.client_id);
+    const boundedStarted = Date.now();
+    const bounded = await fetch(`${BASE}/authorize/consent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ pending: boundedBlob, password: 'still-wrong' }),
+      redirect: 'manual',
+    });
+    const boundedElapsed = Date.now() - boundedStarted;
+    check(
+      'a submission is still answered after repeated abandoned cycles',
+      bounded.status === 401 || bounded.status === 503,
+      `status ${bounded.status}`,
+    );
+    check(
+      'and the wait is bounded rather than inflated by them',
+      boundedElapsed < 25000,
+      `waited ${boundedElapsed}ms, which means the cursor was pushed forward without limit`,
+    );
+
     // The guarantee is a bound on how often a guess is *checked*, server-wide,
     // whatever concurrency the attacker brings. Four guesses fired at once,
     // each with its own freshly rendered consent page, must therefore take
