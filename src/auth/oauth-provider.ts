@@ -400,13 +400,19 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
    * cosmetic.
    */
   async revokeToken(
-    _client: OAuthClientInformationFull,
+    client: OAuthClientInformationFull,
     request: OAuthTokenRevocationRequest,
   ): Promise<void> {
     const stored =
       this.accessTokens.get(request.token) ?? this.refreshTokens.get(request.token);
     // RFC 7009 section 2.2: an unknown token is not an error.
     if (!stored) return;
+    // A token issued to another client is not this caller's to revoke. The
+    // token endpoint authenticates the client, but a public client
+    // authenticates with nothing beyond its own client_id, so without this
+    // check anyone holding a token value could cut off another client's
+    // session. RFC 7009 section 2.1 permits ignoring such a request.
+    if (stored.clientId !== client.client_id) return;
     this.revokeGrant(stored.grantId);
   }
 
@@ -525,6 +531,11 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
     if (dot <= 0) return null;
     const body = blob.slice(0, dot);
     const mac = blob.slice(dot + 1);
+
+    // A sha256 digest is exactly 43 base64url characters. Checking the length
+    // and the alphabet before decoding means a blob cannot be varied by
+    // reshaping its signature, only by forging one.
+    if (mac.length !== 43 || !/^[A-Za-z0-9_-]+$/.test(mac)) return null;
 
     const expected = createHmac('sha256', this.blobKey).update(body).digest();
     let presented: Buffer;

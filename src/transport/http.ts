@@ -12,7 +12,7 @@
  */
 
 import express, { type Express, type Request, type Response, type NextFunction } from 'express';
-import { randomUUID, createHash } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -51,17 +51,30 @@ export interface HttpTransportOptions {
 
 /** Base delay applied to a rejected authorization, doubling per failure. */
 const CONSENT_BASE_DELAY_MS = 1000;
-/** Ceiling on that delay, so a held connection is bounded. */
-const CONSENT_MAX_DELAY_MS = 8000;
-/** How long a failure counts towards the delay for its consent page. */
+/** Ceiling on that delay, so a held socket is bounded. */
+const CONSENT_MAX_DELAY_MS = 30_000;
+/** Failures stop counting towards the delay once the window has passed. */
 const CONSENT_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 /**
  * How many rejected authorizations may be waiting out their delay at once.
  *
- * Beyond this the route stops answering rather than queueing, because the
- * delay holds a socket open and an attacker would otherwise exhaust them.
+ * Beyond this the route drops the connection rather than queueing, because the
+ * delay holds a socket open and an attacker would otherwise exhaust them. A
+ * correct password is answered before this budget is consulted.
  */
 const CONSENT_MAX_INFLIGHT = 16;
+
+/**
+ * Delay before answering a rejected authorization, by failure count.
+ *
+ * Exported for the unit test, which is where the schedule is checked: an
+ * integration test can only observe it by waiting, and waiting out a 30 second
+ * step is not a test anybody runs twice.
+ */
+export function consentDelayFor(failures: number): number {
+  const exponent = Math.min(Math.max(failures, 1) - 1, 10);
+  return Math.min(CONSENT_BASE_DELAY_MS * 2 ** exponent, CONSENT_MAX_DELAY_MS);
+}
 
 interface McpSession {
   transport: StreamableHTTPServerTransport;
@@ -77,11 +90,6 @@ interface McpSession {
    */
   grantId?: string;
   clientId: string;
-}
-
-interface FailureRecord {
-  count: number;
-  firstAt: number;
 }
 
 /** The SDK's bearer middleware attaches this. Not in Express's own types. */
@@ -107,7 +115,19 @@ export class HttpTransportHost {
   private readonly app: Express;
   private readonly sessions = new Map<string, McpSession>();
   private httpServer?: ReturnType<Express['listen']>;
-  private consentFailures = new Map<string, FailureRecord>();
+  /**
+    * Failed authorizations in the current window, counted across every caller.
+    *
+    * Deliberately one number and not a map. An earlier version keyed the
+    * backoff on a hash of the consent blob, reasoning that the operator should
+    * not be slowed by somebody else's failures. That is resettable at will:
+    * `/authorize` needs no authentication and registration is open, so an
+    * attacker fetches a fresh consent page before every guess, every guess is
+    * the first failure for its own key, and the backoff never leaves its first
+    * step. A global count is the only version an attacker cannot reset.
+    */
+  private consentFailures = 0;
+  private consentWindowStartedAt = 0;
   private consentInflight = 0;
 
   constructor(
@@ -165,36 +185,48 @@ export class HttpTransportHost {
         return;
       }
 
-      // Saturation guard. Rejected without checking the password, so flooding
-      // this route cannot be used to strip the delay off a guessing run.
-      if (this.consentInflight >= CONSENT_MAX_INFLIGHT) {
-        logger.warn('Authorization attempt shed; too many pending rejections');
-        res.status(503).type('text/plain').send('Try again shortly');
-        return;
-      }
-
-      const key = createHash('sha256').update(pending).digest('base64url');
+      // The password is checked before any throttling decision, and that
+      // ordering is the whole defence against locking the operator out.
+      // Nothing on the failure path below, neither the delay nor the
+      // concurrency budget, can reach a submission carrying the right
+      // password. An earlier version consulted the budget first, which let an
+      // attacker holding failures open answer the operator's own correct
+      // submission with a 503: the lockout this route exists to avoid.
       const redirectTo = provider.completeAuthorization(pending, password);
 
-      if (!redirectTo) {
-        // Identical for a bad password, a tampered blob and an expired consent
-        // page, and slow enough to make online guessing unattractive. The
-        // delay grows with consecutive failures against the same consent page.
-        const delay = this.registerConsentFailure(key);
-        logger.warn('Authorization attempt rejected', { ip: req.ip, delayMs: delay });
-        this.consentInflight += 1;
-        setTimeout(() => {
-          this.consentInflight -= 1;
-          if (!res.headersSent) {
-            res.status(401).type('text/plain').send('Authorization failed');
-          }
-        }, delay);
+      if (redirectTo) {
+        // Only a correct password clears the counter. A guessing run cannot.
+        this.consentFailures = 0;
+        logger.info('Authorization granted', { ip: req.ip });
+        res.redirect(302, redirectTo);
         return;
       }
 
-      this.consentFailures.delete(key);
-      logger.info('Authorization granted', { ip: req.ip });
-      res.redirect(302, redirectTo);
+      // Identical for a bad password, a tampered blob and an expired consent
+      // page, and slow enough to make online guessing unattractive.
+      const delay = this.registerConsentFailure();
+      logger.warn('Authorization attempt rejected', {
+        ip: req.ip,
+        failures: this.consentFailures,
+        delayMs: delay,
+      });
+
+      if (this.consentInflight >= CONSENT_MAX_INFLIGHT) {
+        // The budget for held sockets is spent. Drop this connection rather
+        // than hold it, which exhausts sockets, or answer it at once, which
+        // would let an attacker strip the delay by saturating the route and
+        // turn it into a fast oracle. The failure is still counted above.
+        req.socket.destroy();
+        return;
+      }
+
+      this.consentInflight += 1;
+      setTimeout(() => {
+        this.consentInflight -= 1;
+        if (!res.headersSent) {
+          res.status(401).type('text/plain').send('Authorization failed');
+        }
+      }, delay);
     });
 
     // --- OAuth 2.1 -------------------------------------------------------
@@ -274,26 +306,30 @@ export class HttpTransportHost {
   /**
    * Record a failed authorization and return how long to wait before replying.
    *
-   * Backoff is per consent page rather than per IP: the IP is unreliable behind
-   * a proxy, and the operator must not be able to be locked out by someone
-   * else's failures. Delay is capped, and a success clears the record.
+   * Throttling is by delay rather than refusal, and that is the point. The SDK
+   * limiter this route used to inherit answered 429, so an attacker who tripped
+   * it locked the operator out of their own consent screen; behind a proxy with
+   * `trust proxy` off, every request shared one counter and tripping it was
+   * trivial. A wrong answer here gets slower and a correct one is never
+   * refused, so there is nothing for an attacker to trip.
+   *
+   * The cost of a global counter is that an attack can slow the operator's own
+   * *mistyped* attempts. It cannot slow a correct one, which is checked before
+   * any of this runs.
    */
-  private registerConsentFailure(key: string): number {
+  private registerConsentFailure(): number {
     const now = Date.now();
-    const existing = this.consentFailures.get(key);
-    const record =
-      existing && now - existing.firstAt < CONSENT_FAILURE_WINDOW_MS
-        ? { count: existing.count + 1, firstAt: existing.firstAt }
-        : { count: 1, firstAt: now };
-    this.consentFailures.set(key, record);
-
-    // Drop stale records so the map does not grow without bound.
-    for (const [k, v] of this.consentFailures) {
-      if (now - v.firstAt > CONSENT_FAILURE_WINDOW_MS) this.consentFailures.delete(k);
+    if (now - this.consentWindowStartedAt > CONSENT_FAILURE_WINDOW_MS) {
+      this.consentWindowStartedAt = now;
+      this.consentFailures = 0;
     }
+    this.consentFailures += 1;
+    return consentDelayFor(this.consentFailures);
+  }
 
-    const exponent = Math.min(record.count - 1, 3);
-    return Math.min(CONSENT_BASE_DELAY_MS * 2 ** exponent, CONSENT_MAX_DELAY_MS);
+  /** Exposed for tests: failed authorizations counted in the current window. */
+  get consentFailureCount(): number {
+    return this.consentFailures;
   }
 
   /**

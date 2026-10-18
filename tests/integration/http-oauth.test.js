@@ -303,6 +303,101 @@ async function main() {
     check('authorization code is present', !!code);
     check('state is echoed back', location.searchParams.get('state') === 'xyz');
 
+    // --- consent throttling --------------------------------------------------
+    //
+    // Two defects lived here, and both are the reason this section is not just
+    // "a wrong password is rejected".
+    //
+    // The backoff was keyed on a hash of the consent blob so that one caller's
+    // failures could not slow another's. An attacker resets that for free:
+    // /authorize needs no authentication and registration is open, so they
+    // fetch a fresh consent page before each guess, every guess is the first
+    // failure for its own key, and the delay never leaves its first step. The
+    // count is global now, and this asserts a fresh page does not reset it.
+    //
+    // The saturation guard also ran before the password was checked, so an
+    // attacker holding failures open had the operator's own correct submission
+    // answered with 503. That is the lockout the route exists to avoid, and the
+    // flood case below is what catches it.
+    let sawTooManyRequests = false;
+
+    async function consentAttempt(password) {
+      // A new consent page every time, which is exactly what an attacker does.
+      const blob = await newGrantBlob(client.client_id);
+      const started = Date.now();
+      const attempt = await fetch(`${BASE}/authorize/consent`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ pending: blob, password }),
+        redirect: 'manual',
+      });
+      if (attempt.status === 429) sawTooManyRequests = true;
+      return { status: attempt.status, elapsed: Date.now() - started };
+    }
+
+    const firstFailure = await consentAttempt('wrong-one');
+    const secondFailure = await consentAttempt('wrong-two');
+    check('a wrong password is rejected', firstFailure.status === 401, `status ${firstFailure.status}`);
+    check(
+      'a fresh consent page does not reset the backoff',
+      secondFailure.elapsed > firstFailure.elapsed + 400,
+      `${firstFailure.elapsed}ms then ${secondFailure.elapsed}ms`,
+    );
+
+    // Flood the route and leave the rejections pending, so the in-flight
+    // budget is spent, then submit the correct password.
+    const flood = [];
+    for (let i = 0; i < 24; i++) {
+      flood.push(
+        newGrantBlob(client.client_id)
+          .then((blob) =>
+            fetch(`${BASE}/authorize/consent`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+              body: new URLSearchParams({ pending: blob, password: `flood-${i}` }),
+              redirect: 'manual',
+            }),
+          )
+          // Past the budget the server drops the connection rather than hold
+          // or answer it, so a rejected fetch here is the design working.
+          .catch(() => null),
+      );
+    }
+    await new Promise((r) => setTimeout(r, 600));
+
+    const rescueBlob = await newGrantBlob(client.client_id);
+    const rescueStarted = Date.now();
+    const rescue = await fetch(`${BASE}/authorize/consent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ pending: rescueBlob, password: PASSWORD }),
+      redirect: 'manual',
+    });
+    const rescueElapsed = Date.now() - rescueStarted;
+    if (rescue.status === 429) sawTooManyRequests = true;
+
+    check(
+      'the correct password is accepted while the route is saturated with failures',
+      rescue.status === 302,
+      `status ${rescue.status}`,
+    );
+    check(
+      'and it is answered without the failure delay',
+      rescueElapsed < 1500,
+      `${rescueElapsed}ms`,
+    );
+    check('no rejection is ever answered with 429', !sawTooManyRequests);
+
+    // The successful submission cleared the counter, so the flows below are
+    // not slowed by the flood. Only a correct password clears it; guessing
+    // cannot.
+    const afterRescue = await consentAttempt(PASSWORD);
+    check(
+      'a correct password is prompt once the counter is cleared',
+      afterRescue.status === 302 && afterRescue.elapsed < 1500,
+      `status ${afterRescue.status} in ${afterRescue.elapsed}ms`,
+    );
+
     // --- PKCE is actually enforced ---------------------------------------
     const wrongVerifier = await fetch(`${BASE}/token`, {
       method: 'POST',
@@ -561,39 +656,6 @@ async function main() {
     const tooBigText = await tooBig.text();
     check('an oversized body is rejected', tooBig.status >= 400 && tooBig.status < 500, `status ${tooBig.status}`);
     check('an oversized body leaks no stack trace', !looksLikeAStackTrace(tooBigText), tooBigText.slice(0, 300));
-
-    // --- the consent gate cannot be used to lock the operator out -----------
-    //
-    // The SDK mounts its authorization handler at /authorize behind a 429 rate
-    // limiter, and `router.use` matches sub-paths, so /authorize/consent
-    // inherited it: an attacker who tripped the limit locked the operator out
-    // of their own consent screen, and behind a proxy with trust proxy off
-    // every request shared one counter. Guessing is slowed by delay now, so
-    // there is nothing to trip.
-    const lockoutProbe = await newGrantBlob(client.client_id);
-    let sawTooManyRequests = false;
-    for (let i = 0; i < 3; i++) {
-      const attempt = await fetch(`${BASE}/authorize/consent`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ pending: lockoutProbe, password: `wrong-${i}` }),
-        redirect: 'manual',
-      });
-      if (attempt.status === 429) sawTooManyRequests = true;
-    }
-    check('repeated wrong passwords are never answered with 429', !sawTooManyRequests);
-
-    const afterFailures = await fetch(`${BASE}/authorize/consent`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ pending: lockoutProbe, password: PASSWORD }),
-      redirect: 'manual',
-    });
-    check(
-      'the correct password still works after repeated failures',
-      afterFailures.status === 302,
-      `status ${afterFailures.status}`,
-    );
 
     // --- unknown routes -------------------------------------------------------
     const notFound = await fetch(`${BASE}/../etc/passwd`);

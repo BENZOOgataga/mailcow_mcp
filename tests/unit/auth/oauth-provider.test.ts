@@ -152,6 +152,28 @@ describe('MailcowOAuthProvider', () => {
       ).resolves.toBeUndefined();
       expect(provider.grantCount).toBe(1);
     });
+
+    it("ignores a request to revoke another client's token", async () => {
+      const provider = makeProvider();
+      const tokens = await issueGrant(provider);
+
+      // A public client authenticates with nothing beyond its own client_id,
+      // so without this check anyone holding a token value could cut off
+      // another client's session. RFC 7009 section 2.1 permits ignoring it.
+      await provider.revokeToken(OTHER_CLIENT, { token: tokens.access_token });
+
+      expect(provider.grantCount).toBe(1);
+      await expect(provider.verifyAccessToken(tokens.access_token)).resolves.toMatchObject({
+        clientId: CLIENT.client_id,
+      });
+    });
+
+    it('still lets the owning client revoke it', async () => {
+      const provider = makeProvider();
+      const tokens = await issueGrant(provider);
+      await provider.revokeToken(CLIENT, { token: tokens.access_token });
+      expect(provider.grantCount).toBe(0);
+    });
   });
 
   describe('scope', () => {
@@ -258,6 +280,29 @@ describe('MailcowOAuthProvider', () => {
       const flipped = (body[0] === 'A' ? 'B' : 'A') + body.slice(1) + mac;
 
       expect(provider.completeAuthorization(flipped, PASSWORD)).toBeNull();
+    });
+
+    it('rejects a signature of the wrong length', async () => {
+      const provider = makeProvider();
+      const blob = await consentBlob(provider);
+      const body = blob.slice(0, blob.lastIndexOf('.'));
+      const mac = blob.slice(blob.lastIndexOf('.') + 1);
+
+      // A sha256 digest is exactly 43 base64url characters. Padding or
+      // truncating it must not produce a second blob that decodes the same
+      // parameters, because anything downstream that treats a blob as an
+      // identity would then see two.
+      expect(provider.completeAuthorization(`${body}.${mac}A`, PASSWORD)).toBeNull();
+      expect(provider.completeAuthorization(`${body}.${mac}==`, PASSWORD)).toBeNull();
+      expect(provider.completeAuthorization(`${body}.${mac.slice(0, -1)}`, PASSWORD)).toBeNull();
+    });
+
+    it('rejects a signature outside the base64url alphabet', async () => {
+      const provider = makeProvider();
+      const blob = await consentBlob(provider);
+      const body = blob.slice(0, blob.lastIndexOf('.'));
+      const mac = blob.slice(blob.lastIndexOf('.') + 1);
+      expect(provider.completeAuthorization(`${body}.${mac.slice(0, -1)}*`, PASSWORD)).toBeNull();
     });
 
     it('rejects a blob with the signature stripped', async () => {
