@@ -28,7 +28,7 @@
  * Grants, not loose tokens
  * ------------------------
  * Every authorization produces a *grant*, and both the access token and the
- * refresh token belong to it. This matters for three things that are wrong if
+ * refresh token belong to it. This matters for four things that are wrong if
  * tokens are tracked individually:
  *
  *   1. Revocation. RFC 7009 says revoking one token SHOULD invalidate the
@@ -38,10 +38,24 @@
  *   2. Lifetime. A rotating refresh token with no absolute expiry is a
  *      permanent credential: each use issues the next one, so a leaked token
  *      never ages out. The grant carries one absolute deadline that rotation
- *      cannot extend.
- *   3. Session binding. The transport binds an MCP session to the grant rather
+ *      cannot extend, and the rotation path refuses to run at all if the grant
+ *      is gone rather than quietly starting a fresh one.
+ *   3. Replay detection. Rotation alone does not tell a retry from a theft.
+ *      Presenting an already-consumed refresh token revokes the whole grant,
+ *      per OAuth 2.1 and RFC 9700 section 4.14.2, because reuse is the only
+ *      signal that distinguishes the two.
+ *   4. Session binding. The transport binds an MCP session to the grant rather
  *      than to a token, so a refresh does not invalidate the session and
  *      another client's token cannot adopt it.
+ *
+ * Everything an unauthenticated caller can reach is bounded
+ * --------------------------------------------------------
+ * `/authorize` and `/register` are open to the internet by design, because
+ * that is how dynamic client registration works. So every structure they can
+ * grow has a hard ceiling, and every string they can supply is truncated
+ * before it is stored or rendered. An unbounded store here is not merely a
+ * memory leak: this process holds the password-guessing backoff in memory, so
+ * anything that can force a restart also resets that backoff.
  */
 
 import { randomBytes, createHash, createHmac, timingSafeEqual } from 'node:crypto';
@@ -57,6 +71,7 @@ import type {
 import {
   InvalidGrantError,
   InvalidScopeError,
+  InvalidTargetError,
   InvalidTokenError,
 } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 
@@ -89,6 +104,21 @@ const GRANT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
  */
 const CONSENT_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * Ceilings on everything an unauthenticated caller can grow or supply.
+ *
+ * Dynamic registration is open, so these are the only thing between a stranger
+ * and this process's heap. The client-name limit does double duty: it is also
+ * what stops a registration from turning the consent page into an amplifier,
+ * and what stops attacker-supplied text from pushing the one field the
+ * operator must read off the screen.
+ */
+const MAX_CLIENTS = 100;
+const MAX_CLIENT_NAME_LENGTH = 64;
+const MAX_REDIRECT_URIS = 10;
+const MAX_URI_LENGTH = 512;
+const MAX_CONTACTS = 5;
+
 export interface MailcowOAuthOptions {
   /**
    * Shared secret the operator enters on the consent screen.
@@ -102,6 +132,15 @@ export interface MailcowOAuthOptions {
   issuerUrl: URL;
   /** Scopes this server understands. Defaults to SUPPORTED_SCOPES. */
   scopesSupported?: string[];
+  /**
+   * Called with a grant id whenever a grant is revoked or expires.
+   *
+   * The transport uses this to close MCP sessions bound to that grant. Without
+   * it, revoking a token leaves the session object resident, and an event
+   * stream opened before the revocation keeps being served, because bearer
+   * auth is checked per request and not per message.
+   */
+  onGrantRevoked?: (grantId: string) => void;
 }
 
 interface StoredAuthCode {
@@ -124,6 +163,7 @@ interface StoredToken {
 
 interface Grant {
   clientId: string;
+  /** The scopes currently in force. Narrowed by a narrowing refresh. */
   scopes: string[];
   resource?: string;
   /** Absolute deadline. Rotation does not move it. */
@@ -133,6 +173,8 @@ interface Grant {
 }
 
 interface PendingAuthorization {
+  /** Single-use marker. One operator approval must mint exactly one code. */
+  jti: string;
   clientId: string;
   redirectUri: string;
   codeChallenge: string;
@@ -153,31 +195,119 @@ function token(): string {
   return randomBytes(32).toString('base64url');
 }
 
+function truncate(value: string, limit: number): string {
+  return value.length > limit ? `${value.slice(0, limit - 1)}…` : value;
+}
+
 /**
- * In-memory client store with dynamic registration.
+ * Keep only the registration fields this server uses, each within a bound.
+ *
+ * The SDK's registration schema bounds no string, and the request body limit is
+ * a megabyte, so without this a single registration can park most of a
+ * megabyte in the clients map for the lifetime of the process, and have it
+ * echoed back out of the consent page on every unauthenticated GET.
+ */
+function sanitizeClient(client: OAuthClientInformationFull): OAuthClientInformationFull {
+  const redirectUris = (client.redirect_uris ?? [])
+    .filter((uri) => typeof uri === 'string' && uri.length <= MAX_URI_LENGTH)
+    .slice(0, MAX_REDIRECT_URIS);
+
+  const sanitized: OAuthClientInformationFull = {
+    ...client,
+    redirect_uris: redirectUris,
+  };
+
+  if (typeof client.client_name === 'string') {
+    sanitized.client_name = truncate(client.client_name, MAX_CLIENT_NAME_LENGTH);
+  }
+  if (Array.isArray(client.contacts)) {
+    sanitized.contacts = client.contacts
+      .filter((c): c is string => typeof c === 'string')
+      .slice(0, MAX_CONTACTS)
+      .map((c) => truncate(c, MAX_URI_LENGTH));
+  }
+  // Nothing reads these, and both are unbounded strings in the SDK schema.
+  delete sanitized.software_statement;
+  delete sanitized.logo_uri;
+  delete sanitized.client_uri;
+  delete sanitized.policy_uri;
+  delete sanitized.tos_uri;
+
+  return sanitized;
+}
+
+/**
+ * In-memory client store with dynamic registration, bounded.
  *
  * Claude registers itself through DCR on first connect; ChatGPT may be given a
  * client ID and secret manually. Both paths end up here.
+ *
+ * Registration is open to the internet, so the map is capped and evicts the
+ * least recently used entry. A client holding a live grant is pinned and never
+ * evicted, so an attacker cannot register in a loop to push the operator's own
+ * working client out and break their sessions.
  */
 class InMemoryClientsStore implements OAuthRegisteredClientsStore {
   private clients = new Map<string, OAuthClientInformationFull>();
+  private pinned = new Set<string>();
 
   async getClient(clientId: string): Promise<OAuthClientInformationFull | undefined> {
-    return this.clients.get(clientId);
+    const client = this.clients.get(clientId);
+    if (client) {
+      // Map preserves insertion order, so re-inserting marks this entry as the
+      // most recently used.
+      this.clients.delete(clientId);
+      this.clients.set(clientId, client);
+    }
+    return client;
   }
 
   async registerClient(client: OAuthClientInformationFull): Promise<OAuthClientInformationFull> {
-    this.clients.set(client.client_id, client);
-    return client;
+    const sanitized = sanitizeClient(client);
+    this.evict();
+    this.clients.set(sanitized.client_id, sanitized);
+    return sanitized;
   }
 
   /** Pre-register a client for vendors that do not support DCR. */
   seed(client: OAuthClientInformationFull): void {
-    this.clients.set(client.client_id, client);
+    const sanitized = sanitizeClient(client);
+    this.clients.set(sanitized.client_id, sanitized);
+    this.pinned.add(sanitized.client_id);
+  }
+
+  /** Protect a client from eviction while it holds a grant. */
+  pin(clientId: string): void {
+    this.pinned.add(clientId);
+  }
+
+  unpin(clientId: string): void {
+    this.pinned.delete(clientId);
+  }
+
+  private evict(): void {
+    while (this.clients.size >= MAX_CLIENTS) {
+      let victim: string | undefined;
+      for (const key of this.clients.keys()) {
+        if (!this.pinned.has(key)) {
+          victim = key;
+          break;
+        }
+      }
+      // Every remaining entry holds a live grant. Stop rather than evict one:
+      // dropping it would break a working session, and the grant ceiling plus
+      // the 30 day deadline already bound this case.
+      if (victim === undefined) return;
+      this.clients.delete(victim);
+    }
   }
 
   list(): OAuthClientInformationFull[] {
     return [...this.clients.values()];
+  }
+
+  get size(): number {
+    return this.clients.size;
   }
 }
 
@@ -187,6 +317,15 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
   private readonly accessTokens = new Map<string, StoredToken>();
   private readonly refreshTokens = new Map<string, StoredToken>();
   private readonly grants = new Map<string, Grant>();
+  /**
+   * Refresh tokens that have already been rotated, mapped to their grant.
+   *
+   * Presenting one of these means the token was used twice, which is the
+   * signal that it leaked rather than that the client retried.
+   */
+  private readonly consumedRefreshTokens = new Map<string, string>();
+  /** Consent approvals already redeemed, mapped to when they stop mattering. */
+  private readonly redeemedApprovals = new Map<string, number>();
   private readonly scopes: string[];
   /**
    * Key for signing the pending-authorization blob. Per-process and never
@@ -226,8 +365,7 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
   }
 
   /**
-   * Render the consent screen, or complete the flow when the operator submits
-   * the correct password.
+   * Render the consent screen.
    *
    * The SDK routes GET /authorize here. We serve a minimal form on GET and
    * handle the submission on POST through `completeAuthorization` below, called
@@ -251,7 +389,20 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
     // the metadata advertises and what Claude's registration asks for.
     const granted = requested.length > 0 ? requested : [...this.scopes];
 
+    // RFC 8707: an authorization server must not issue a token for a resource
+    // it does not serve. Without this the audience recorded on the token is
+    // whatever the caller asked for, which any downstream consumer would
+    // reasonably trust. Compared by origin rather than full URL because the
+    // MCP endpoint sits on a path under the issuer and clients legitimately
+    // send either form.
+    if (params.resource && !this.servesResource(params.resource)) {
+      throw new InvalidTargetError(
+        `This server does not serve the requested resource: ${params.resource.toString()}`,
+      );
+    }
+
     const pending = this.sealPending({
+      jti: token(),
       clientId: client.client_id,
       redirectUri: params.redirectUri,
       codeChallenge: params.codeChallenge,
@@ -266,20 +417,42 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
     res.send(consentPage(client, pending, params.redirectUri, granted));
   }
 
+  private servesResource(resource: URL): boolean {
+    try {
+      return resource.origin === this.options.issuerUrl.origin;
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Validate the operator password and mint an authorization code.
    *
    * Returns the redirect URL the browser should be sent to, or null when the
-   * password is wrong, the blob was tampered with, or the consent page has
-   * expired. The caller is responsible for not revealing which.
+   * blob is unusable or the password is wrong. The caller is responsible for
+   * not revealing which.
    */
   completeAuthorization(pendingBlob: string, password: string): string | null {
+    this.sweep();
+
+    // The blob is verified before the password is compared, so a caller who
+    // has not been through /authorize cannot use this route as a password
+    // oracle at all.
+    const pending = this.openPending(pendingBlob);
+    if (!pending) return null;
+
     if (!secretsMatch(password, this.options.operatorPassword)) {
       return null;
     }
 
-    const pending = this.openPending(pendingBlob);
-    if (!pending) return null;
+    // One approval, one code. Without this the same (blob, password) pair is
+    // replayable for the ten minutes the blob lives, and each replay produces
+    // an independent grant with its own refresh token and its own 30 day
+    // deadline. Those siblings survive revoking the grant the client knows
+    // about, because they are different grants, and they appear in no client
+    // UI. A browser form resubmission is enough to create one.
+    if (this.redeemedApprovals.has(pending.jti)) return null;
+    this.redeemedApprovals.set(pending.jti, pending.expiresAt);
 
     const code = token();
     this.codes.set(code, {
@@ -311,6 +484,9 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
   async exchangeAuthorizationCode(
     client: OAuthClientInformationFull,
     authorizationCode: string,
+    _codeVerifier?: string,
+    redirectUri?: string,
+    resource?: URL,
   ): Promise<OAuthTokens> {
     const stored = this.codes.get(authorizationCode);
     if (!stored || stored.expiresAt < Date.now()) {
@@ -319,24 +495,52 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
     if (stored.clientId !== client.client_id) {
       throw new InvalidGrantError('Authorization code was issued to another client');
     }
+    // RFC 6749 section 4.1.3. PKCE already binds the code to the client
+    // instance, so this is a second layer rather than the only one, but the
+    // value was recorded at authorization time and checking it costs nothing.
+    if (redirectUri !== undefined && redirectUri !== stored.redirectUri) {
+      throw new InvalidGrantError('redirect_uri does not match the authorization request');
+    }
+    if (resource && !this.servesResource(resource)) {
+      throw new InvalidTargetError('This server does not serve the requested resource');
+    }
 
     // Single use. Delete before issuing so a replay cannot race.
     this.codes.delete(authorizationCode);
 
-    return this.issueTokens(client.client_id, stored.scopes, stored.resource);
+    return this.issueForNewGrant(client.client_id, stored.scopes, stored.resource);
   }
 
   async exchangeRefreshToken(
     client: OAuthClientInformationFull,
     refreshToken: string,
     scopes?: string[],
+    resource?: URL,
   ): Promise<OAuthTokens> {
     const stored = this.refreshTokens.get(refreshToken);
+
     if (!stored) {
+      // Reuse of an already-rotated token means two parties hold the chain, and
+      // only one of them should. OAuth 2.1 and RFC 9700 section 4.14.2 require
+      // revoking the whole grant on detected reuse: rotation on its own cannot
+      // tell a client retry from a stolen token, and without this the thief
+      // keeps the live chain while the legitimate client quietly re-authorizes
+      // and sees nothing worse than one unexpected sign-in.
+      const leakedGrantId = this.consumedRefreshTokens.get(refreshToken);
+      if (leakedGrantId) {
+        this.revokeGrant(leakedGrantId);
+        throw new InvalidGrantError(
+          'Refresh token has already been used; the grant has been revoked',
+        );
+      }
       throw new InvalidGrantError('Refresh token is unknown or revoked');
     }
+
     if (stored.clientId !== client.client_id) {
       throw new InvalidGrantError('Refresh token was issued to another client');
+    }
+    if (resource && !this.servesResource(resource)) {
+      throw new InvalidTargetError('This server does not serve the requested resource');
     }
 
     const grant = this.grants.get(stored.grantId);
@@ -347,9 +551,12 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
 
     // A refresh may narrow a token's authority but never widen it. Without this
     // check a client granted read could ask for write on refresh and get it,
-    // which makes the scope recorded on the grant decorative.
+    // which makes the scope recorded on the grant decorative. Measured against
+    // the grant rather than the presented token, so a narrowing refresh cannot
+    // be walked back up afterwards.
+    const ceiling = grant.scopes;
     if (scopes && scopes.length > 0) {
-      const widened = scopes.filter((s) => !stored.scopes.includes(s));
+      const widened = scopes.filter((s) => !ceiling.includes(s));
       if (widened.length > 0) {
         throw new InvalidScopeError(
           `Refresh cannot widen scope; not granted: ${widened.join(', ')}`,
@@ -357,12 +564,17 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
       }
     }
 
-    // Rotate: the presented refresh token is consumed.
+    // Rotate: the presented refresh token is consumed, and remembered as
+    // consumed so that a later presentation is detected as reuse.
     this.refreshTokens.delete(refreshToken);
     grant.refreshTokens.delete(refreshToken);
+    this.consumedRefreshTokens.set(refreshToken, stored.grantId);
 
     const next = scopes && scopes.length > 0 ? scopes : stored.scopes;
-    return this.issueTokens(client.client_id, next, stored.resource, stored.grantId);
+    // Narrowing is permanent for the grant, so it is also the new ceiling.
+    grant.scopes = next;
+
+    return this.issueForExistingGrant(stored.grantId, client.client_id, next, stored.resource);
   }
 
   async verifyAccessToken(accessToken: string): Promise<AuthInfo> {
@@ -430,11 +642,28 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
       for (const t of grant.accessTokens) this.accessTokens.delete(t);
       for (const t of grant.refreshTokens) this.refreshTokens.delete(t);
       this.grants.delete(grantId);
-      return;
+      if (!this.clientHasGrant(grant.clientId)) this._clientsStore.unpin(grant.clientId);
+    } else {
+      // Defensive: a token pointing at a grant that is already gone.
+      for (const [t, v] of this.accessTokens) if (v.grantId === grantId) this.accessTokens.delete(t);
+      for (const [t, v] of this.refreshTokens) if (v.grantId === grantId) this.refreshTokens.delete(t);
     }
-    // Defensive: a token pointing at a grant that is already gone.
-    for (const [t, v] of this.accessTokens) if (v.grantId === grantId) this.accessTokens.delete(t);
-    for (const [t, v] of this.refreshTokens) if (v.grantId === grantId) this.refreshTokens.delete(t);
+
+    for (const [t, id] of this.consumedRefreshTokens) {
+      if (id === grantId) this.consumedRefreshTokens.delete(t);
+    }
+
+    // Let the transport close any MCP session bound to this grant. Without it
+    // the session object stays resident, and an event stream opened before the
+    // revocation keeps being served, because bearer auth is per request.
+    this.options.onGrantRevoked?.(grantId);
+  }
+
+  private clientHasGrant(clientId: string): boolean {
+    for (const grant of this.grants.values()) {
+      if (grant.clientId === clientId) return true;
+    }
+    return false;
   }
 
   private forgetAccessToken(accessToken: string): void {
@@ -443,37 +672,60 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
     if (stored) this.grants.get(stored.grantId)?.accessTokens.delete(accessToken);
   }
 
-  private issueTokens(
+  /** First issuance for a freshly approved authorization. */
+  private issueForNewGrant(clientId: string, scopes: string[], resource?: string): OAuthTokens {
+    this.sweep();
+
+    const grantId = token();
+    const grant: Grant = {
+      clientId,
+      scopes,
+      resource,
+      expiresAt: Date.now() + GRANT_TTL_MS,
+      accessTokens: new Set<string>(),
+      refreshTokens: new Set<string>(),
+    };
+    this.grants.set(grantId, grant);
+    this._clientsStore.pin(clientId);
+
+    return this.mintPair(grantId, grant, clientId, scopes, resource);
+  }
+
+  /**
+   * Re-issuance for an existing grant, on refresh.
+   *
+   * Throws rather than creating a grant when the id is unknown. An earlier
+   * version fell through to the first-issuance path here, which silently minted
+   * a replacement grant with a *renewed* 30 day deadline and handed back a
+   * working token pair, falsifying the one invariant the grant exists to
+   * enforce.
+   */
+  private issueForExistingGrant(
+    grantId: string,
     clientId: string,
     scopes: string[],
     resource?: string,
-    existingGrantId?: string,
   ): OAuthTokens {
-    this.sweep();
-
-    let grantId = existingGrantId;
-    let grant = grantId ? this.grants.get(grantId) : undefined;
-
+    const grant = this.grants.get(grantId);
     if (!grant) {
-      grantId = token();
-      grant = {
-        clientId,
-        scopes,
-        resource,
-        expiresAt: Date.now() + GRANT_TTL_MS,
-        accessTokens: new Set<string>(),
-        refreshTokens: new Set<string>(),
-      };
-      this.grants.set(grantId, grant);
+      throw new InvalidGrantError('Grant no longer exists; re-authorization is required');
     }
+    return this.mintPair(grantId, grant, clientId, scopes, resource);
+  }
 
-    const resolvedGrantId = grantId as string;
+  private mintPair(
+    grantId: string,
+    grant: Grant,
+    clientId: string,
+    scopes: string[],
+    resource?: string,
+  ): OAuthTokens {
     const accessToken = token();
     const refreshToken = token();
     const accessExpiresAt = Date.now() + ACCESS_TOKEN_TTL_SECONDS * 1000;
 
     this.accessTokens.set(accessToken, {
-      grantId: resolvedGrantId,
+      grantId,
       clientId,
       scopes,
       expiresAt: accessExpiresAt,
@@ -482,7 +734,7 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
     // The refresh token inherits the grant's absolute deadline rather than
     // getting a fresh one, so rotating cannot extend the chain indefinitely.
     this.refreshTokens.set(refreshToken, {
-      grantId: resolvedGrantId,
+      grantId,
       clientId,
       scopes,
       expiresAt: grant.expiresAt,
@@ -500,7 +752,12 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
     };
   }
 
-  /** Drop expired codes, tokens and grants so the maps do not grow without bound. */
+  /**
+   * Drop expired codes, tokens, grants and approval markers.
+   *
+   * Called from both issuance and consent submission, so the bound does not
+   * depend on a successful token exchange ever happening.
+   */
   private sweep(): void {
     const now = Date.now();
     for (const [k, v] of this.codes) if (v.expiresAt < now) this.codes.delete(k);
@@ -511,6 +768,9 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
         this.grants.get(v.grantId)?.refreshTokens.delete(k);
       }
     }
+    for (const [k, expiresAt] of this.redeemedApprovals) {
+      if (expiresAt < now) this.redeemedApprovals.delete(k);
+    }
     for (const [id, g] of this.grants) if (g.expiresAt < now) this.revokeGrant(id);
   }
 
@@ -519,13 +779,19 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
     return this.grants.size;
   }
 
+  /** Visible for tests: number of registered clients retained. */
+  get clientCount(): number {
+    return this._clientsStore.size;
+  }
+
   // --- pending-authorization blob ------------------------------------------
   //
   // The blob carries the authorization parameters across the consent page, so
   // the server holds no state between rendering the form and the operator
   // submitting it. It travels through the operator's browser, which makes it
   // attacker-reachable, so it is signed with a per-process key: the parameters
-  // that come back are the ones this server put in.
+  // that come back are the ones this server put in. The `jti` makes an
+  // approval single-use; see completeAuthorization.
 
   private sealPending(payload: PendingAuthorization): string {
     const body = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
@@ -557,9 +823,15 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
 
     try {
       const parsed = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+      // The payload is signed, so these are defence in depth against a future
+      // change to what gets sealed rather than against an attacker.
       if (typeof parsed?.expiresAt !== 'number' || parsed.expiresAt < Date.now()) return null;
+      if (typeof parsed?.jti !== 'string' || parsed.jti.length === 0) return null;
       if (typeof parsed?.redirectUri !== 'string' || typeof parsed?.clientId !== 'string') return null;
-      if (!Array.isArray(parsed?.scopes)) return null;
+      if (typeof parsed?.codeChallenge !== 'string') return null;
+      if (!Array.isArray(parsed?.scopes) || parsed.scopes.some((s: unknown) => typeof s !== 'string')) {
+        return null;
+      }
       return parsed as PendingAuthorization;
     } catch {
       return null;
@@ -571,9 +843,17 @@ export class MailcowOAuthProvider implements OAuthServerProvider {
  * Minimal consent screen.
  *
  * Deliberately plain: no external assets, no inline scripts, nothing that a
- * CSP would have to allow. It states which client is asking and what it will be
- * able to do, because an operator approving mail-server access should see that
- * before typing a password.
+ * CSP would have to allow.
+ *
+ * The layout is part of the security control, not decoration. The one thing an
+ * operator must read is where the authorization code will be sent, so it comes
+ * first, before anything the requesting client chose. An earlier version put
+ * the client's self-declared name above it and let that name be any length,
+ * which meant an attacker could register a client whose "name" was forty
+ * kilobytes of reassuring text and push the real destination several screens
+ * down. The password field also carried `autofocus`, so the browser scrolled
+ * the operator straight past both warnings to the form. Between them, the one
+ * field the attacker could not forge was the one field the operator never saw.
  */
 function consentPage(
   client: OAuthClientInformationFull,
@@ -585,14 +865,10 @@ function consentPage(
   // registration open, that is anyone on the internet, so an attacker can
   // register a client called "Claude", point its redirect at a host they
   // control, and send the operator a genuine authorization URL on the right
-  // domain with valid TLS. Nothing about the name can be trusted.
-  //
-  // The redirect target is the one field the attacker cannot disguise: it is
-  // where the authorization code will actually be sent. Showing it, and
-  // showing its origin separately and prominently, is what lets an operator
-  // tell the real flow from the forged one.
-  const name = escapeHtml(client.client_name ?? client.client_id);
-  const target = escapeHtml(redirectUri);
+  // domain with valid TLS. Nothing about the name can be trusted, which is why
+  // it is truncated, escaped, and rendered below the destination.
+  const name = escapeHtml(truncate(client.client_name ?? client.client_id, MAX_CLIENT_NAME_LENGTH));
+  const target = escapeHtml(truncate(redirectUri, MAX_URI_LENGTH));
   const scopeList = scopes.length > 0 ? escapeHtml(scopes.join(', ')) : '(none)';
   let origin: string;
   try {
@@ -608,13 +884,14 @@ function consentPage(
 <title>Authorize access to mailcow</title>
 <style>
   :root { color-scheme: light dark; }
-  body { font: 16px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 4rem auto; padding: 0 1rem; }
-  .client { font-weight: 600; }
-  .warn { border-left: 3px solid #c2410c; padding: .5rem 0 .5rem .75rem; margin: 1.5rem 0; }
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 34rem; margin: 3rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.4rem; }
   .dest { border: 2px solid #c2410c; border-radius: 4px; padding: .75rem 1rem; margin: 1.5rem 0; }
   .dest-label { font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; opacity: .75; }
   .dest-origin { font-size: 1.35rem; font-weight: 700; font-family: ui-monospace, monospace; word-break: break-all; margin: .25rem 0; }
   .dest-full { font-size: .8rem; opacity: .7; font-family: ui-monospace, monospace; word-break: break-all; }
+  .warn { border-left: 3px solid #c2410c; padding: .5rem 0 .5rem .75rem; margin: 1.5rem 0; }
+  .claimed { font-family: ui-monospace, monospace; word-break: break-all; }
   code { font-family: ui-monospace, monospace; }
   label { display: block; margin: 1.5rem 0 .25rem; font-weight: 600; }
   input[type=password] { width: 100%; padding: .6rem; font-size: 1rem; box-sizing: border-box; }
@@ -623,22 +900,24 @@ function consentPage(
 </head>
 <body>
   <h1>Authorize access to mailcow</h1>
-  <p>A client calling itself <span class="client">${name}</span> is requesting access
-     to your mailcow server.</p>
 
   <div class="dest">
-    <div class="dest-label">The authorization code will be sent to</div>
+    <div class="dest-label">Read this first. The authorization code will be sent to</div>
     <div class="dest-origin">${origin}</div>
     <div class="dest-full">${target}</div>
   </div>
 
   <div class="warn">
-    <strong>Check that destination.</strong> The client name above is chosen by
-    whoever registered the client and proves nothing. If that origin is not one
-    you recognise as belonging to the service you are connecting, for example
-    <code>claude.ai</code> or <code>chatgpt.com</code>, stop now: approving would
-    hand control of this mail server to whoever owns it.
+    <strong>Check that destination.</strong> If it is not a host belonging to the
+    service you are connecting, for example <code>claude.ai</code> or
+    <code>chatgpt.com</code>, stop now: approving would hand control of this mail
+    server to whoever owns it.
   </div>
+
+  <p>The client requesting access calls itself <span class="claimed">${name}</span>.
+     That name was chosen by whoever registered the client and proves nothing;
+     anyone can register a client under any name. Only the destination above
+     cannot be faked.</p>
 
   <div class="warn">
     Approving grants the tools this server has registered, which may include
@@ -646,10 +925,11 @@ function consentPage(
     <code>${scopeList}</code>. Only continue if you started this authorization
     yourself, just now.
   </div>
+
   <form method="POST" action="${CONSENT_SUBMIT_PATH}">
     <input type="hidden" name="pending" value="${pending}">
     <label for="password">Operator password</label>
-    <input type="password" id="password" name="password" autocomplete="current-password" autofocus required>
+    <input type="password" id="password" name="password" autocomplete="current-password" required>
     <button type="submit">Authorize</button>
   </form>
 </body>

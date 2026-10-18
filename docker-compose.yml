@@ -19,7 +19,12 @@ services:
     #
     # Expected keys: MAILCOW_API_URL, MAILCOW_API_KEY, MAILCOW_API_ACCESS_TYPE,
     # MAILCOW_VERIFY_SSL, MCP_PUBLIC_URL, MCP_OAUTH_PASSWORD, MCP_TRUST_PROXY,
-    # MCP_ENABLE_DESTRUCTIVE_TOOLS, MCP_ENABLE_OUTBOUND_TOOLS.
+    # MCP_ENABLE_DESTRUCTIVE_TOOLS, MCP_ENABLE_CREDENTIAL_TOOLS,
+    # MCP_ENABLE_OUTBOUND_TOOLS.
+    #
+    # MCP_PUBLIC_URL is required and has no default. Without it the server
+    # refuses to start, and under the restart policy below that is a crash
+    # loop rather than a one-off failure.
     env_file:
       - .env
 

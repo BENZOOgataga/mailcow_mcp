@@ -79,15 +79,19 @@ who launched the process.
 
 ## Tool exposure: what ships enabled, and what does not
 
-Two groups of tools are **implemented but not registered by default**. They are
-not merely refused at call time — they are never registered, so they do not
+Three groups of tools are **implemented but not registered by default**. They
+are not merely refused at call time: they are never registered, so they do not
 appear in `tools/list`. A model cannot see them, cannot be argued into calling
 them, and cannot tell a user it was blocked.
+
+All three flags are specific to this transport. Over stdio every tool is
+registered, because the caller is whoever launched the process.
 
 ### Destructive — `MCP_ENABLE_DESTRUCTIVE_TOOLS`
 
 `delete_domain` · `delete_mailbox` · `delete_user` · `delete_dkim_key` ·
-`update_dkim_key` · `delete_queue_items`
+`update_dkim_key` · `delete_queue_items` · `delete_sync_job` ·
+`update_domain` · `create_dkim_key`
 
 **These are off by default because a publicly exposed MCP server has a very
 large blast radius.** Deleting a domain destroys every mailbox under it.

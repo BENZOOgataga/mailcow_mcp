@@ -488,6 +488,171 @@ async function main() {
     });
     check('the consumed refresh token no longer works', !staleRefresh.ok, `status ${staleRefresh.status}`);
 
+    // --- the authorization path cannot be locked out ------------------------
+    //
+    // The SDK applies express-rate-limit to /authorize (100 per 15 minutes),
+    // /register (20 per hour), /token and /revoke, keyed on req.ip and
+    // answering 429. Behind a reverse proxy with trust proxy off, which is the
+    // default and the documented deployment, req.ip is the proxy's address for
+    // every request on earth, so each limiter is one global bucket that any
+    // single caller drains. 100 unauthenticated GETs and the operator can
+    // never render a consent page again; 20 registrations and no client can be
+    // added at all.
+    //
+    // An earlier version of this branch claimed to have fixed that by moving
+    // the consent POST ahead of the SDK router. It had not: the POST is
+    // useless without a blob, and the blob comes from GET /authorize, which
+    // was still behind the limiter.
+    const floodStatuses = new Set();
+    for (let i = 0; i < 130; i++) {
+      const probe = await fetch(
+        `${BASE}/authorize?response_type=code&client_id=${encodeURIComponent(client.client_id)}` +
+          `&redirect_uri=${encodeURIComponent(CALLBACK)}` +
+          `&code_challenge=${pkce().challenge}&code_challenge_method=S256&state=s`,
+      );
+      floodStatuses.add(probe.status);
+      await probe.arrayBuffer();
+    }
+    check(
+      '130 unauthenticated authorize requests are never answered with 429',
+      !floodStatuses.has(429),
+      [...floodStatuses].join(','),
+    );
+
+    const afterFlood = await newGrantBlob(client.client_id);
+    check('the operator can still obtain a consent page afterwards', !!afterFlood);
+
+    const regStatuses = new Set();
+    for (let i = 0; i < 30; i++) {
+      const reg2 = await fetch(`${BASE}/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_name: `flood-${i}`,
+          redirect_uris: [CALLBACK],
+          grant_types: ['authorization_code', 'refresh_token'],
+          response_types: ['code'],
+          token_endpoint_auth_method: 'none',
+        }),
+      });
+      regStatuses.add(reg2.status);
+      await reg2.arrayBuffer();
+    }
+    check(
+      '30 registrations are never answered with 429',
+      !regStatuses.has(429),
+      [...regStatuses].join(','),
+    );
+
+    // --- abandoned submissions do not lock the operator out -----------------
+    //
+    // The slot a submission reserves used to be held for its full interval
+    // whether or not anyone was still connected, and over-budget submissions
+    // were refused with a 503 decided before the password was read. Together
+    // that meant twelve POSTs the attacker aborted after 30ms, costing them no
+    // open sockets at all, answered the operator's correct password with a 503
+    // in two milliseconds.
+    const abandoned = [];
+    for (let i = 0; i < 12; i++) {
+      const blob = await newGrantBlob(client.client_id);
+      const controller = new AbortController();
+      abandoned.push(
+        fetch(`${BASE}/authorize/consent`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ pending: blob, password: `abandon-${i}` }),
+          redirect: 'manual',
+          signal: controller.signal,
+        }).catch(() => null),
+      );
+      setTimeout(() => controller.abort(), 30);
+    }
+    await Promise.allSettled(abandoned);
+    await new Promise((r) => setTimeout(r, 300));
+
+    const rescueBlob = await newGrantBlob(client.client_id);
+    const rescueStarted = Date.now();
+    const rescue = await fetch(`${BASE}/authorize/consent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ pending: rescueBlob, password: PASSWORD }),
+      redirect: 'manual',
+    });
+    const rescueElapsed = Date.now() - rescueStarted;
+    check(
+      'the correct password is accepted after a run of abandoned submissions',
+      rescue.status === 302,
+      `status ${rescue.status} after ${rescueElapsed}ms`,
+    );
+    check(
+      'and it is not refused or shed',
+      rescue.status !== 503 && rescue.status !== 429,
+      `status ${rescue.status}`,
+    );
+
+    // --- error responses still carry the security headers -------------------
+    //
+    // The header middleware was registered after the body parsers, so a parser
+    // error short-circuited to the error handler and the response carried none
+    // of them: no nosniff, no frame denial, no no-store. That is exactly the
+    // class of response the error handler exists to produce.
+    const parserError = await fetch(`${BASE}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{"jsonrpc": "2.0", broken',
+    });
+    await parserError.arrayBuffer();
+    check(
+      'a body-parser error response carries X-Content-Type-Options',
+      parserError.headers.get('x-content-type-options') === 'nosniff',
+      parserError.headers.get('x-content-type-options') || '(absent)',
+    );
+    check(
+      'a body-parser error response is not cacheable',
+      (parserError.headers.get('cache-control') || '').includes('no-store'),
+      parserError.headers.get('cache-control') || '(absent)',
+    );
+
+    const healthz = await fetch(`${BASE}/healthz`);
+    await healthz.arrayBuffer();
+    check(
+      'the consent page origin sets a form-action policy',
+      (healthz.headers.get('content-security-policy') || '').includes("form-action 'self'"),
+      healthz.headers.get('content-security-policy') || '(absent)',
+    );
+
+    // --- method handling on /mcp -------------------------------------------
+    const putMcp = await fetch(`${BASE}/mcp`, { method: 'PUT' });
+    await putMcp.arrayBuffer();
+    check(
+      'an unsupported method on /mcp is a 405 with Allow',
+      putMcp.status === 405 && (putMcp.headers.get('allow') || '').includes('POST'),
+      `status ${putMcp.status} allow ${putMcp.headers.get('allow') || '(absent)'}`,
+    );
+
+    // --- the advertised resource metadata URL resolves ----------------------
+    const unauth = await fetch(`${BASE}/mcp`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+    });
+    await unauth.arrayBuffer();
+    const advertised = /resource_metadata="([^"]+)"/.exec(
+      unauth.headers.get('www-authenticate') || '',
+    )?.[1];
+    check('the challenge advertises a resource metadata URL', !!advertised);
+    if (advertised) {
+      const metaRes = await fetch(advertised);
+      await metaRes.arrayBuffer();
+      // Built from the origin alone, this 404s for any deployment whose public
+      // URL carries a path prefix, which is a documented configuration.
+      check(
+        'the advertised resource metadata URL resolves',
+        metaRes.ok,
+        `${advertised} -> ${metaRes.status}`,
+      );
+    }
+
     // --- two clients at once ------------------------------------------------
     //
     // Why this test exists: a single `Server` instance can be connected to

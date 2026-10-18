@@ -157,9 +157,9 @@ class MailcowMCPServer {
       const transport = config.transport;
       const policy = new ToolPolicy({
         remote: transport?.mode === 'http',
-        enableDestructive: transport?.tools.enableDestructive ?? false,
-        enableCredential: transport?.tools.enableCredential ?? false,
-        enableOutbound: transport?.tools.enableOutbound ?? false,
+        enableDestructive: transport?.tools?.enableDestructive ?? false,
+        enableCredential: transport?.tools?.enableCredential ?? false,
+        enableOutbound: transport?.tools?.enableOutbound ?? false,
       });
       this.toolRegistry.setPolicy(policy);
       for (const warning of policy.warnings()) {
@@ -1198,6 +1198,15 @@ class MailcowMCPServer {
       );
     }
 
+    if (!publicUrl) {
+      throw new Error(
+        'MCP_TRANSPORT=http requires MCP_PUBLIC_URL: the public https origin ' +
+          'clients reach this server at, for example https://mcp.example.com. ' +
+          'OAuth redirect URIs and both discovery documents are built from it, ' +
+          'so there is no safe default to fall back to.',
+      );
+    }
+
     let parsedPublicUrl: URL;
     try {
       parsedPublicUrl = new URL(publicUrl);
@@ -1205,19 +1214,28 @@ class MailcowMCPServer {
       throw new Error(`MCP_PUBLIC_URL is not a valid URL: ${publicUrl}`);
     }
 
-    // OAuth redirect URIs and the metadata documents are built from this URL.
-    // If it is wrong, clients fail at the authorization step with errors that
-    // point nowhere near the cause, so check it here instead.
-    if (parsedPublicUrl.protocol !== 'https:' && parsedPublicUrl.hostname !== 'localhost' && parsedPublicUrl.hostname !== '127.0.0.1') {
-      this.logger.warn(
-        `MCP_PUBLIC_URL uses ${parsedPublicUrl.protocol} for a non-local host. ` +
-          'Remote MCP clients require HTTPS; this will only work if a proxy terminates TLS in front.',
+    // This is a hard requirement, not advice. The SDK's issuer check rejects
+    // any non-https issuer that is not localhost or 127.0.0.1, so a value like
+    // http://0.0.0.0:3000 does not "work behind a proxy": the router throws
+    // during construction and the process exits. Failing here instead names
+    // the variable and the rule.
+    const isLocal =
+      parsedPublicUrl.hostname === 'localhost' || parsedPublicUrl.hostname === '127.0.0.1';
+    if (parsedPublicUrl.protocol !== 'https:' && !isLocal) {
+      throw new Error(
+        `MCP_PUBLIC_URL must use https for a non-local host; got ${publicUrl}. ` +
+          'Terminate TLS on a reverse proxy and set this to the public https origin.',
       );
     }
 
+    // The provider reports revoked grants so the transport can close any MCP
+    // session opened under them. Without it, revoking a token leaves the
+    // session resident and an event stream opened beforehand keeps being
+    // served, because bearer auth is checked per request, not per message.
     const provider = new MailcowOAuthProvider({
       operatorPassword: oauthPassword,
       issuerUrl: parsedPublicUrl,
+      onGrantRevoked: (grantId) => this.httpHost?.closeSessionsForGrant(grantId),
     });
 
     this.httpHost = new HttpTransportHost(() => this.createMcpServer(), {

@@ -37,27 +37,25 @@ export const DESTRUCTIVE_TOOLS: readonly string[] = [
   'delete_queue_items',
   'delete_sync_job',
 
-  // The four below are "update" and "create" tools, and gating them is not
+  // The two below are an "update" and a "create", and gating them is not
   // obvious until you look at what their inputs allow.
   //
-  // update_mailbox and update_user accept a `password` field. Setting a
-  // mailbox password is the single highest-value action on this server: it
-  // does not destroy anything, so a deny-list built around the word "delete"
-  // misses it entirely, and it yields every outcome the other entries here
-  // exist to prevent. Whoever learns the new password reads all of that
-  // mailbox's mail, sends authenticated mail from a trusted domain, and
-  // deletes whatever they like — reached without a single delete tool and
-  // without send_email. Reset postmaster@ and that is the whole domain.
-  //
-  // update_domain and update_mailbox can also set `active: 0`, which stops
-  // mail flow silently. That is the same quiet-breakage argument made for
-  // update_dkim_key above.
+  // update_domain can set `active: 0`, which stops mail flow for every mailbox
+  // under the domain and destroys nothing, so it reads as a routine edit. That
+  // is the same quiet-breakage argument made for update_dkim_key above.
   //
   // create_dkim_key is here because mailcow's /api/v1/add/dkim is not
   // documented to reject a domain that already holds a key. If it regenerates
   // instead, "create" reproduces exactly the DMARC breakage update_dkim_key is
   // gated for. Gated until someone verifies the behaviour against a real
   // mailcow; if it does reject, it can move back to the write tier.
+  //
+  // Note that update_mailbox and update_user are NOT here. They are in
+  // CREDENTIAL_TOOLS, for the reasons set out on that list. Worth knowing when
+  // reading this one: update_mailbox can also set `active: 0` on a single
+  // mailbox, so enabling the credential group alone is enough to stop one
+  // mailbox's mail silently, even though that group is described as tools that
+  // destroy nothing.
   'update_domain',
   'create_dkim_key',
 ] as const;
@@ -138,7 +136,10 @@ export function tierOf(toolName: string): ToolTier {
   if (DESTRUCTIVE_TOOLS.includes(toolName)) return 'destructive';
   if (CREDENTIAL_TOOLS.includes(toolName)) return 'credential';
   if (OUTBOUND_TOOLS.includes(toolName)) return 'outbound';
-  if (/^(list|get|check|test|health)/.test(toolName)) return 'read';
+  // Anchored on the separator on purpose. Without the underscore a future
+  // `listen_*`, `checkout_*` or `getaway_*` would be classed read, and so be
+  // reachable with a mailcow:read token.
+  if (/^(list|get|check|test|health)(_|$)/.test(toolName)) return 'read';
   return 'write';
 }
 
@@ -166,6 +167,21 @@ export class ToolPolicy {
   /** Whether a tool may be registered in this deployment. */
   evaluate(toolName: string): PolicyDecision {
     const tier = tierOf(toolName);
+
+    // Over stdio every tool is registered, which is the behaviour that existed
+    // before this policy and the behaviour this policy's whole argument rests
+    // on: the caller is the user who launched the process, and the exposure
+    // these flags exist to manage does not exist.
+    //
+    // This check was missing, and its absence was not a small bug. `remote`
+    // was read only by warnings(), so the opt-in flags gated stdio as well,
+    // and every existing desktop user silently lost all nine destructive
+    // tools, all six credential tools and send_email on upgrade. No error, no
+    // migration note: the tools were simply absent from tools/list, and a call
+    // came back "not found".
+    if (!this.options.remote) {
+      return { allowed: true, tier };
+    }
 
     if (tier === 'destructive' && !this.options.enableDestructive) {
       return {
@@ -239,7 +255,7 @@ export class ToolPolicy {
     return out;
   }
 
-  /** Summary for logs and for the `get_config` tool. */
+  /** Summary for the startup log line. */
   describe(): Record<string, unknown> {
     return {
       remote: this.options.remote,

@@ -59,6 +59,12 @@ export class ToolRegistry implements IToolRegistry {
    * is known when the registry is constructed.
    */
   setPolicy(policy: ToolPolicy): void {
+    // A new policy supersedes the previous one's decisions. Without clearing
+    // this, a tool withheld under the old policy and then registered under a
+    // more permissive one would enter `tools` (and so `tools/list`) while
+    // registerHandler kept returning early, leaving a listed tool whose call
+    // fails with "not found".
+    this.suppressed.clear();
     this.policy = policy;
   }
 

@@ -64,8 +64,12 @@ TLS. A `Dockerfile` and `docker-compose.yml` are included.
 
 ### Tools withheld by default
 
-Two groups are implemented but **not registered** unless you opt in, so they do
-not appear in `tools/list` at all:
+Three groups are implemented but **not registered** unless you opt in, so they
+do not appear in `tools/list` at all.
+
+These flags apply to the **HTTP transport only**. Over stdio every tool below
+is registered as usual, because the caller is whoever launched the process.
+The tool counts in *Available Tools* describe the stdio inventory.
 
 | Flag | Tools | Why |
 |---|---|---|

@@ -97,7 +97,7 @@ describe('ToolPolicy', () => {
     });
 
     it('requires the write scope for ungated write tools', () => {
-      for (const tool of ['create_domain', 'flush_queue', 'hold_queue_items']) {
+      for (const tool of ['create_domain', 'flush_queue', 'hold_queue_item']) {
         expect(scopeFor(tool)).toBe('mailcow:write');
       }
     });
@@ -118,6 +118,67 @@ describe('ToolPolicy', () => {
       ];
       for (const tool of tools) {
         expect(scopeFor(tool)).toBe(tierOf(tool) === 'read' ? 'mailcow:read' : 'mailcow:write');
+      }
+    });
+  });
+
+  /**
+   * The transport distinction, which is the policy's entire premise.
+   *
+   * This was broken: `evaluate()` never read `remote`, so the opt-in flags
+   * gated stdio too and every existing desktop user silently lost all nine
+   * destructive tools, all six credential tools and send_email on upgrade. The
+   * tools were simply absent from tools/list and a call returned "not found".
+   */
+  describe('stdio', () => {
+    const localDefault = new ToolPolicy({
+      remote: false,
+      enableDestructive: false,
+      enableCredential: false,
+      enableOutbound: false,
+    });
+
+    it('registers every gated tool over stdio with the flags at their defaults', () => {
+      for (const tool of [...DESTRUCTIVE_TOOLS, ...CREDENTIAL_TOOLS, ...OUTBOUND_TOOLS]) {
+        expect(localDefault.isAllowed(tool)).toBe(true);
+      }
+    });
+
+    it('registers ordinary tools over stdio', () => {
+      for (const tool of ['list_domains', 'get_mailbox', 'create_domain']) {
+        expect(localDefault.isAllowed(tool)).toBe(true);
+      }
+    });
+
+    it('still reports the tier it would have applied remotely', () => {
+      // The classification is unchanged; only the gate is transport-dependent.
+      expect(localDefault.evaluate('delete_domain').tier).toBe('destructive');
+      expect(localDefault.evaluate('update_mailbox').tier).toBe('credential');
+      expect(localDefault.evaluate('send_email').tier).toBe('outbound');
+    });
+
+    it('withholds the same tools as soon as the transport is a network one', () => {
+      // Same flags, different transport: this is the only thing that should
+      // change the decision.
+      for (const tool of [...DESTRUCTIVE_TOOLS, ...CREDENTIAL_TOOLS, ...OUTBOUND_TOOLS]) {
+        expect(safeRemote.isAllowed(tool)).toBe(false);
+      }
+    });
+  });
+
+  describe('tierOf prefix anchoring', () => {
+    it('does not classify a tool as read on a partial prefix match', () => {
+      // Unanchored, these were all 'read' and so reachable with a
+      // mailcow:read token.
+      for (const name of ['listen_socket', 'checkout_session', 'getaway_car', 'testament']) {
+        expect(tierOf(name)).toBe('write');
+        expect(scopeFor(name)).toBe('mailcow:write');
+      }
+    });
+
+    it('still classifies the real read tools as read', () => {
+      for (const name of ['list_domains', 'get_mailbox', 'check_email_status', 'health_check']) {
+        expect(tierOf(name)).toBe('read');
       }
     });
   });

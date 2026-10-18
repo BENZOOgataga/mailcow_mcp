@@ -9,14 +9,51 @@
  * This module deliberately does not terminate TLS. Run it behind a reverse
  * proxy that does, and bind it to loopback. A mail-administration endpoint
  * should not be the thing parsing TLS from the open internet.
+ *
+ * Where availability is defended, and where it is not
+ * ---------------------------------------------------
+ * Two of the endpoints here are reached by the *operator's browser*
+ * (`/authorize` and the consent POST). The rest are reached by the *vendor's
+ * backend* (`/token`, `/register`, `/mcp`, the metadata documents). That split
+ * matters more than it looks, because nothing inside this process can tell the
+ * operator from an attacker: `/authorize` needs no authentication, dynamic
+ * client registration is open, and any token this process could hand the
+ * operator an attacker can request too.
+ *
+ * So every in-process mechanism that bounds an attacker also bounds the
+ * operator, and the only question is which failure you prefer. Three versions
+ * of this file got that wrong in three different ways:
+ *
+ *   - It inherited the SDK's 429 limiter on the whole `/authorize` subtree.
+ *     100 unauthenticated GETs, and the operator can never render a consent
+ *     page again.
+ *   - It then moved the consent POST out of that subtree and called the
+ *     ordering load-bearing. It was not: the POST is useless without a blob,
+ *     and the blob comes from `GET /authorize`, which was still behind the
+ *     limiter. The lockout was untouched.
+ *   - It then shed over-budget submissions with a 503 decided before the
+ *     password was read. Password-independent, so not an oracle, but eight
+ *     *aborted* POSTs cost an attacker no open sockets at all and answered the
+ *     operator's correct password with a 503 in two milliseconds.
+ *
+ * What this file does now: it refuses nobody on the operator path. No 429, no
+ * 503, no dropped socket. Guessing is bounded by serialising the password
+ * checks, so a guess costs wall-clock time on a single global slot. Volumetric
+ * abuse is bounded at the reverse proxy, which is the only layer that can see
+ * a source address worth keying on, and the operator-facing paths are expected
+ * to be restricted there to the operator rather than to the vendor ranges.
+ * `docs/REMOTE_DEPLOYMENT.md` sets out the two allowlists that implies.
  */
 
 import express, { type Express, type Request, type Response, type NextFunction } from 'express';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { mcpAuthRouter } from '@modelcontextprotocol/sdk/server/auth/router.js';
+import {
+  mcpAuthRouter,
+  getOAuthProtectedResourceMetadataUrl,
+} from '@modelcontextprotocol/sdk/server/auth/router.js';
 import { requireBearerAuth } from '@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { CONSENT_SUBMIT_PATH, type MailcowOAuthProvider } from '../auth/oauth-provider.js';
@@ -39,13 +76,13 @@ export type McpServerFactory = () => Server | Promise<Server>;
 export interface HttpTransportOptions {
   host: string;
   port: number;
-  /** Public origin this server is reached at, e.g. https://mail.example.com/mcp */
+  /** Public origin this server is reached at, e.g. https://mail.example.com */
   publicUrl: URL;
   provider: MailcowOAuthProvider;
   logger: Logger;
   /** Trust X-Forwarded-* headers. Enable only when behind a known proxy. */
   trustProxy: boolean;
-  /** Max JSON body size. Mail admin payloads are small. */
+  /** Max JSON body size on /mcp. Mail admin payloads are small. */
   maxBodyBytes?: number;
 }
 
@@ -56,32 +93,24 @@ const CONSENT_MAX_INTERVAL_MS = 30_000;
 /** Failures stop counting towards the interval once the window has passed. */
 const CONSENT_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 /**
- * How many submissions may be waiting for their turn to be checked.
+ * Longest a submission will be held waiting for its check slot.
  *
- * Past this the route sheds, and it sheds *before* looking at the password, so
- * the decision cannot depend on whether the password was right.
+ * Past this the submission is checked immediately rather than refused. That
+ * weakens the rate bound under heavy concurrency and is the deliberate trade:
+ * refusing is what locked the operator out, and an attacker who floods to get
+ * past this still has to hold a connection per attempt, which the proxy is
+ * where you bound.
  */
-const CONSENT_MAX_QUEUE = 8;
+const CONSENT_MAX_WAIT_MS = 60_000;
 
-/**
- * Minimum interval between password checks, by failure count in the window.
- *
- * This gates how often a guess is *evaluated*, which is the only thing that
- * actually limits guessing. An earlier version used the same schedule to delay
- * the *reply* instead, and that is worth spelling out because it looked
- * equivalent and was not: an attacker does not need the reply, only the
- * verdict. They would saturate the route, every guess would still be evaluated
- * at full speed, a wrong one had its socket dropped at once and a right one
- * returned an immediate redirect. The delay slowed nobody and the saturation
- * path was a clean negative oracle.
- *
- * Exported for the unit test, which is where the schedule is checked: an
- * integration test can only observe it by waiting.
- */
-export function consentIntervalFor(failures: number): number {
-  const exponent = Math.min(Math.max(failures, 1) - 1, 10);
-  return Math.min(CONSENT_BASE_INTERVAL_MS * 2 ** exponent, CONSENT_MAX_INTERVAL_MS);
-}
+/** Idle MCP sessions are closed after this long without a request. */
+const SESSION_IDLE_MS = 30 * 60 * 1000;
+/** How often to look for idle sessions. */
+const SESSION_SWEEP_MS = 5 * 60 * 1000;
+/** Hard ceiling on concurrent MCP sessions. */
+const MAX_SESSIONS = 64;
+/** Longest `stop()` waits for in-flight work before forcing sockets shut. */
+const SHUTDOWN_GRACE_MS = 5000;
 
 interface McpSession {
   transport: StreamableHTTPServerTransport;
@@ -97,6 +126,7 @@ interface McpSession {
    */
   grantId?: string;
   clientId: string;
+  lastSeenAt: number;
 }
 
 /** The SDK's bearer middleware attaches this. Not in Express's own types. */
@@ -112,33 +142,48 @@ function grantIdOf(auth: AuthInfo | undefined): string | undefined {
 }
 
 /**
+ * Short, stable tag for a session id in logs.
+ *
+ * A session id is a bearer capability, so logging it in full means log access
+ * plus any valid token is a session takeover.
+ */
+function sessionTag(id: string): string {
+  return createHash('sha256').update(id).digest('hex').slice(0, 12);
+}
+
+/** Minimum interval between password checks, by failure count in the window. */
+export function consentIntervalFor(failures: number): number {
+  const exponent = Math.min(Math.max(failures, 1) - 1, 10);
+  return Math.min(CONSENT_BASE_INTERVAL_MS * 2 ** exponent, CONSENT_MAX_INTERVAL_MS);
+}
+
+type HostState = 'idle' | 'starting' | 'running' | 'stopping' | 'stopped';
+
+/**
  * One transport, and one `Server`, per MCP session.
  *
  * Streamable HTTP is session-oriented: the client initializes once, receives a
- * session id, and sends subsequent requests with that id. Sessions are held in
- * memory and dropped when the transport closes.
+ * session id, and sends subsequent requests with that id.
  */
 export class HttpTransportHost {
   private readonly app: Express;
   private readonly sessions = new Map<string, McpSession>();
   private httpServer?: ReturnType<Express['listen']>;
-  /**
-    * Failed authorizations in the current window, counted across every caller.
-    *
-    * Deliberately one number and not a map. An earlier version keyed the
-    * backoff on a hash of the consent blob, reasoning that the operator should
-    * not be slowed by somebody else's failures. That is resettable at will:
-    * `/authorize` needs no authentication and registration is open, so an
-    * attacker fetches a fresh consent page before every guess, every guess is
-    * the first failure for its own key, and the backoff never leaves its first
-    * step. A global count is the only version an attacker cannot reset.
-    */
+  private state: HostState = 'idle';
+  private startPromise?: Promise<void>;
+
   private consentFailures = 0;
   private consentWindowStartedAt = 0;
-  /** Submissions waiting for, or currently holding, the check slot. */
-  private consentQueueDepth = 0;
   /** Earliest time the next password check may run. */
   private consentNextSlotAt = 0;
+  /** Counter identifying the most recent slot reservation. */
+  private consentReservationSeq = 0;
+  /** Timers for submissions waiting on a slot, so shutdown can settle them. */
+  private readonly pendingConsentWaits = new Set<{
+    timer: NodeJS.Timeout;
+    settle: () => void;
+  }>();
+  private sessionSweeper?: NodeJS.Timeout;
 
   constructor(
     private readonly createMcpServer: McpServerFactory,
@@ -157,44 +202,63 @@ export class HttpTransportHost {
     this.app.set('trust proxy', trustProxy ? 1 : false);
     this.app.disable('x-powered-by');
 
-    this.app.use(
-      express.json({ limit: this.options.maxBodyBytes ?? 1_000_000 }),
-    );
-    this.app.use(express.urlencoded({ extended: false, limit: 64_000 }));
-
+    // Security headers go on BEFORE the body parsers. Registered after them, a
+    // parser error short-circuits straight to the error handler and the
+    // response carries none of these, which is exactly the class of response
+    // the error handler exists for.
     this.app.use((_req, res, next) => {
-      // This endpoint is machine-to-machine and serves one HTML page (consent).
-      // Nothing here should ever be framed, sniffed or cached.
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('X-Frame-Options', 'DENY');
       res.setHeader('Referrer-Policy', 'no-referrer');
       res.setHeader('Cache-Control', 'no-store');
+      // The one HTML page has no scripts and no external assets, so this costs
+      // nothing today. `form-action 'self'` is the clause that earns its keep:
+      // it stops a future bug from retargeting the password form.
+      res.setHeader(
+        'Content-Security-Policy',
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+      );
       next();
     });
 
+    // The large JSON limit belongs to /mcp alone. Mounted globally it also
+    // raised the limit on the unauthenticated registration endpoint, because
+    // the body was already parsed by the time the SDK's own tighter parser
+    // ran, turning registration into a way to park a megabyte per request.
+    const mcpJson = express.json({ limit: this.options.maxBodyBytes ?? 1_000_000 });
+    const consentForm = express.urlencoded({ extended: false, limit: 64_000 });
+
     // --- Consent submission ----------------------------------------------
-    //
-    // Registered BEFORE mcpAuthRouter, and that ordering is load-bearing.
-    //
-    // The SDK mounts its authorization handler with `router.use('/authorize',
-    // ...)`, which matches sub-paths, so `/authorize/consent` would otherwise
-    // inherit that handler's rate limiter: a fixed 100 requests per 15 minutes
-    // keyed on the client IP. Two problems with inheriting it. It returns 429,
-    // so an attacker who trips it locks the operator out of their own consent
-    // screen; and with `trust proxy` off behind a proxy every request appears
-    // to come from the proxy's address, which makes that one shared counter
-    // and the lockout trivial to trigger.
-    //
-    // Password guessing is throttled here instead, with delay rather than
-    // refusal: a wrong answer gets slower, but a correct one is never refused,
-    // so there is nothing for an attacker to trip.
-    this.app.post(CONSENT_SUBMIT_PATH, (req: Request, res: Response) => {
-      void this.handleConsentSubmission(req, res);
+    this.app.post(CONSENT_SUBMIT_PATH, consentForm, (req: Request, res: Response) => {
+      // Explicitly caught: this is the only route that handles the password,
+      // and an unhandled rejection here would take the process down along with
+      // every live session.
+      this.handleConsentSubmission(req, res).catch((error: unknown) => {
+        logger.error('Consent submission failed', error as Error);
+        if (!res.headersSent) {
+          res.status(500).type('text/plain').send('Authorization failed');
+        }
+      });
     });
 
     // --- OAuth 2.1 -------------------------------------------------------
-    // Mounts /authorize, /token, /register (DCR), /revoke and the
-    // .well-known metadata documents the clients discover the server through.
+    //
+    // Every SDK limiter is turned off, on purpose.
+    //
+    // They are `express-rate-limit` keyed on `req.ip` and they answer 429. With
+    // `trust proxy` off behind a proxy, which is both the default and the
+    // documented deployment, `req.ip` is the proxy's address for every request
+    // on earth, so each limiter is a single global bucket that any one caller
+    // drains: 100 requests per 15 minutes locks the operator out of
+    // `/authorize`, and 20 per hour locks the vendor out of `/register`, after
+    // which no client can be added at all.
+    //
+    // Nothing is lost by removing them. `/authorize` is a stateless render,
+    // registration is bounded by the clients store's own ceiling and
+    // truncation rather than by request count, and password guessing is
+    // bounded by the serialised check below. Volumetric abuse is the reverse
+    // proxy's job, because the proxy is the only layer here that can see a
+    // source address worth keying on.
     this.app.use(
       mcpAuthRouter({
         provider,
@@ -202,6 +266,10 @@ export class HttpTransportHost {
         resourceServerUrl: publicUrl,
         resourceName: 'mailcow MCP',
         scopesSupported: provider.scopesSupported,
+        authorizationOptions: { rateLimit: false },
+        clientRegistrationOptions: { rateLimit: false },
+        tokenOptions: { rateLimit: false },
+        revocationOptions: { rateLimit: false },
       }),
     );
 
@@ -218,16 +286,25 @@ export class HttpTransportHost {
     // No `requiredScopes` here on purpose. Scope is enforced per tool, where
     // the read/write distinction actually lives, so a client that holds only
     // one of the two scopes still connects and simply cannot call the tools it
-    // was not granted. Requiring a scope at this boundary would reject such a
-    // client at `initialize` with nothing useful to tell it.
+    // was not granted.
+    //
+    // The resource metadata URL is derived with the SDK's own helper, because
+    // the SDK mounts that document under the public URL's path. Building it
+    // from the origin alone advertised a URL that 404s for any deployment with
+    // a path prefix, which is a documented configuration.
     const auth = requireBearerAuth({
       verifier: provider,
-      resourceMetadataUrl: new URL('/.well-known/oauth-protected-resource', publicUrl).toString(),
+      resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(publicUrl),
     });
 
-    this.app.post('/mcp', auth, (req, res) => void this.handlePost(req, res));
+    this.app.post('/mcp', auth, mcpJson, (req, res) => void this.handlePost(req, res));
     this.app.get('/mcp', auth, (req, res) => void this.handleSessionRequest(req, res));
     this.app.delete('/mcp', auth, (req, res) => void this.handleSessionRequest(req, res));
+    // Anything else on /mcp is a method error, not a missing route.
+    this.app.all('/mcp', (_req, res) => {
+      res.setHeader('Allow', 'GET, POST, DELETE');
+      res.status(405).json(jsonRpcError(-32000, 'Method not allowed'));
+    });
 
     // Anything else is not part of the contract.
     this.app.use((_req, res) => {
@@ -248,13 +325,16 @@ export class HttpTransportHost {
       const error = err instanceof Error ? err : new Error(String(err));
       const status = statusOf(err);
 
-      // Full detail server-side, where the operator can see it.
       logger.error('Request failed', error, { path: req.path, method: req.method, status });
 
       if (res.headersSent) {
         res.end();
         return;
       }
+      // Set again here rather than relying on the middleware above, so these
+      // hold even if the ordering is changed later.
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('Cache-Control', 'no-store');
       // Nothing from the error object goes to the client, not the message and
       // not the stack. A caller learns the shape of its own mistake from the
       // status code.
@@ -269,24 +349,22 @@ export class HttpTransportHost {
   /**
    * Handle a consent submission under a global check-rate limit.
    *
-   * Three properties, each of which replaces a mistake made here before:
+   * Four properties, each replacing a mistake made here before:
    *
    *   1. The throttle limits how often a password is *checked*, not how long
-   *      the answer takes. Delaying the answer leaves the check running at
+   *      the answer takes. Delaying only the answer leaves the check running at
    *      full speed, and the verdict is what an attacker is after.
-   *   2. Shedding happens before the check and on a condition that has nothing
-   *      to do with the password, so a shed cannot be read as "wrong".
+   *   2. Nobody is refused. An earlier version shed over-budget submissions
+   *      with a 503 before reading the password. Password-independent, so not
+   *      an oracle, but eight *aborted* POSTs cost an attacker nothing and
+   *      answered the operator's correct password with a 503 in two
+   *      milliseconds. Past the wait ceiling a submission is checked
+   *      immediately instead.
    *   3. A correct password waits its turn like any other. Letting it skip the
-   *      queue is what turned saturation into a fast negative oracle: drops
-   *      meant wrong, an immediate redirect meant right.
-   *
-   * The cost is that a sustained attack can delay, and past the queue bound
-   * refuse, the operator's own submissions. There is no way to avoid that on an
-   * endpoint that cannot tell the operator from anyone else: `/authorize` needs
-   * no authentication and registration is open, so any token this route could
-   * hand the operator, an attacker can request too. The controls that do
-   * distinguish them live in front of this process (a source allowlist on the
-   * proxy) and in the password's entropy, not here.
+   *      queue is what turned saturation into a fast negative oracle.
+   *   4. A caller that disconnects releases its slot. Without that, a slot was
+   *      held for its full reserved interval by a request nobody was waiting
+   *      on, which is what made the aborted-POST attack free.
    */
   private async handleConsentSubmission(req: Request, res: Response): Promise<void> {
     const { provider, logger } = this.options;
@@ -296,43 +374,33 @@ export class HttpTransportHost {
       return;
     }
 
-    if (this.consentQueueDepth >= CONSENT_MAX_QUEUE) {
-      logger.warn('Authorization submission shed; check queue is full', { ip: req.ip });
-      res.status(503).type('text/plain').send('Try again shortly');
+    const waited = await this.awaitConsentSlot(req);
+    if (!waited) {
+      // The caller gave up while waiting. Nothing to answer.
       return;
     }
 
-    this.consentQueueDepth += 1;
-    try {
-      await this.awaitConsentSlot();
+    const redirectTo = provider.completeAuthorization(pending, password);
 
-      const redirectTo = provider.completeAuthorization(pending, password);
+    if (redirectTo) {
+      // Only a correct password clears the throttle, and guessing cannot
+      // produce one.
+      this.consentFailures = 0;
+      this.consentNextSlotAt = 0;
+      logger.info('Authorization granted', { ip: req.ip });
+      if (!res.headersSent) res.redirect(302, redirectTo);
+      return;
+    }
 
-      if (redirectTo) {
-        // Only a correct password clears the throttle, and guessing cannot
-        // produce one. Clearing the reserved-slot cursor as well as the count
-        // matters: without it, slots already reserved by an attack keep
-        // spacing out the operator's next submissions after they have proven
-        // who they are.
-        this.consentFailures = 0;
-        this.consentNextSlotAt = 0;
-        logger.info('Authorization granted', { ip: req.ip });
-        if (!res.headersSent) res.redirect(302, redirectTo);
-        return;
-      }
-
-      // Identical for a bad password, a tampered blob and an expired consent
-      // page. The caller does not learn which.
-      this.registerConsentFailure();
-      logger.warn('Authorization attempt rejected', {
-        ip: req.ip,
-        failures: this.consentFailures,
-      });
-      if (!res.headersSent) {
-        res.status(401).type('text/plain').send('Authorization failed');
-      }
-    } finally {
-      this.consentQueueDepth -= 1;
+    // Identical for a bad password, a tampered blob and an expired consent
+    // page. The caller does not learn which.
+    this.registerConsentFailure();
+    logger.warn('Authorization attempt rejected', {
+      ip: req.ip,
+      failures: this.consentFailures,
+    });
+    if (!res.headersSent) {
+      res.status(401).type('text/plain').send('Authorization failed');
     }
   }
 
@@ -340,13 +408,16 @@ export class HttpTransportHost {
    * Wait until this submission's turn to be checked.
    *
    * Reserves the next slot before waiting, so concurrent submissions queue
-   * behind one another instead of all being checked at once. The spacing is
-   * taken from the failure count, which is global for the window because any
+   * behind one another instead of all being checked at once. The spacing comes
+   * from the failure count, which is global for the window because any
    * per-caller key is resettable: `/authorize` is unauthenticated and
    * registration is open, so a fresh consent page per guess resets anything
    * keyed to the page.
+   *
+   * Returns false if the caller disconnected while waiting, in which case the
+   * slot is given back.
    */
-  private async awaitConsentSlot(): Promise<void> {
+  private async awaitConsentSlot(req: Request): Promise<boolean> {
     const now = Date.now();
     if (now - this.consentWindowStartedAt > CONSENT_FAILURE_WINDOW_MS) {
       this.consentWindowStartedAt = now;
@@ -355,12 +426,69 @@ export class HttpTransportHost {
     }
 
     const slot = Math.max(now, this.consentNextSlotAt);
-    this.consentNextSlotAt = slot + consentIntervalFor(this.consentFailures + 1);
+    let wait = slot - now;
+    let seq = 0;
 
-    const wait = slot - now;
-    if (wait > 0) {
-      await new Promise<void>((resolve) => setTimeout(resolve, wait));
+    // Check immediately rather than refuse, past the ceiling. See property 2.
+    // This also caps how far ahead the cursor can be pushed, so the longest an
+    // attacker can make the operator wait is bounded even before the rollback
+    // below.
+    if (wait > CONSENT_MAX_WAIT_MS) {
+      wait = 0;
+    } else {
+      this.consentNextSlotAt = slot + consentIntervalFor(this.consentFailures + 1);
+      seq = ++this.consentReservationSeq;
     }
+
+    if (wait <= 0) return true;
+
+    return new Promise<boolean>((resolve) => {
+      const entry = {
+        timer: setTimeout(() => {
+          this.pendingConsentWaits.delete(entry);
+          cleanup();
+          resolve(true);
+        }, wait),
+        // Used by stop(), so a shutdown does not block on a sleeping request.
+        settle: (): void => {
+          clearTimeout(entry.timer);
+          this.pendingConsentWaits.delete(entry);
+          cleanup();
+          resolve(false);
+        },
+      };
+      this.pendingConsentWaits.add(entry);
+
+      // A caller that hangs up must not keep its slot. Holding it was what let
+      // an attacker lock the operator out with aborted requests and no open
+      // sockets at all.
+      const onGone = (): void => {
+        clearTimeout(entry.timer);
+        this.pendingConsentWaits.delete(entry);
+        // Hand the slot back when nothing has reserved after it, so a run of
+        // abandoned requests does not push the cursor forward and slow down
+        // whoever submits next.
+        if (seq !== 0 && seq === this.consentReservationSeq) {
+          this.consentNextSlotAt = slot;
+          this.consentReservationSeq -= 1;
+        }
+        cleanup();
+        resolve(false);
+      };
+      const cleanup = (): void => {
+        req.off('aborted', onGone);
+        res_off();
+      };
+      const res = req.res;
+      const res_off = (): void => {
+        res?.off('close', onCloseIfUnsent);
+      };
+      const onCloseIfUnsent = (): void => {
+        if (!res || !res.writableEnded) onGone();
+      };
+      req.on('aborted', onGone);
+      res?.on('close', onCloseIfUnsent);
+    });
   }
 
   private registerConsentFailure(): void {
@@ -381,17 +509,65 @@ export class HttpTransportHost {
    * Check that the caller owns the session it names.
    *
    * A session id travels in a plain header and is a capability by itself, so
-   * without this any authenticated caller could drive any live session: one
-   * tenant of the same deployment, or an attacker holding a token from a
-   * separate authorization, resuming someone else's conversation and reading
-   * its results.
+   * without this any authenticated caller could drive any live session:
+   * an attacker holding a token from a separate authorization resuming someone
+   * else's conversation and reading its results.
+   *
+   * Fails closed. An earlier version fell back to comparing client ids when
+   * either side lacked a grant id, which would make two separate
+   * authorizations of the same registered client interchangeable.
    */
   private ownsSession(session: McpSession, auth: AuthInfo | undefined): boolean {
-    const grantId = grantIdOf(auth);
-    if (session.grantId && grantId) return session.grantId === grantId;
-    // No grant id on one side or the other (a provider that does not supply
-    // one). Fall back to the client, which is weaker but not nothing.
-    return !!auth && session.clientId === auth.clientId;
+    if (!auth) return false;
+    if (session.grantId) return session.grantId === grantIdOf(auth);
+    return session.clientId === auth.clientId;
+  }
+
+  /** Close every session opened under a grant that has just been revoked. */
+  closeSessionsForGrant(grantId: string): void {
+    for (const [id, session] of this.sessions) {
+      if (session.grantId !== grantId) continue;
+      this.sessions.delete(id);
+      this.options.logger.info('Closing session for revoked grant', {
+        session: sessionTag(id),
+      });
+      void this.closeSession(session);
+    }
+  }
+
+  private async closeSession(session: McpSession): Promise<void> {
+    try {
+      await session.transport.close();
+    } catch {
+      /* best effort */
+    }
+    try {
+      await session.server.close();
+    } catch {
+      /* best effort */
+    }
+  }
+
+  /**
+   * Close sessions that have gone quiet.
+   *
+   * A session is only removed otherwise when its transport closes, which needs
+   * the client to send DELETE or drop the connection. Claude and ChatGPT open a
+   * session per conversation and are not obliged to delete it, so without this
+   * the map grows for the life of the process in normal use, each entry holding
+   * its own protocol object and handler set.
+   */
+  private sweepSessions(): void {
+    const cutoff = Date.now() - SESSION_IDLE_MS;
+    for (const [id, session] of this.sessions) {
+      if (session.lastSeenAt > cutoff) continue;
+      this.sessions.delete(id);
+      this.options.logger.info('Closing idle MCP session', {
+        session: sessionTag(id),
+        sessions: this.sessions.size,
+      });
+      void this.closeSession(session);
+    }
   }
 
   private async handlePost(req: Request, res: Response): Promise<void> {
@@ -404,7 +580,7 @@ export class HttpTransportHost {
       if (existing) {
         if (!this.ownsSession(existing, auth)) {
           this.options.logger.warn('Rejected cross-grant session access', {
-            sessionId,
+            session: sessionTag(sessionId as string),
             clientId: auth?.clientId,
           });
           // 404 rather than 403: a caller that does not own the session should
@@ -412,6 +588,7 @@ export class HttpTransportHost {
           res.status(404).json(jsonRpcError(-32001, 'Unknown session'));
           return;
         }
+        existing.lastSeenAt = Date.now();
         await existing.transport.handleRequest(req, res, req.body);
         return;
       }
@@ -422,6 +599,17 @@ export class HttpTransportHost {
       }
       if (!isInitializeRequest(req.body)) {
         res.status(400).json(jsonRpcError(-32000, 'First request must be initialize'));
+        return;
+      }
+      if (this.sessions.size >= MAX_SESSIONS) {
+        // Try to make room before refusing.
+        this.sweepSessions();
+      }
+      if (this.sessions.size >= MAX_SESSIONS) {
+        this.options.logger.warn('Refusing new MCP session; at capacity', {
+          sessions: this.sessions.size,
+        });
+        res.status(503).json(jsonRpcError(-32000, 'Server at session capacity'));
         return;
       }
 
@@ -435,9 +623,10 @@ export class HttpTransportHost {
             server,
             grantId: grantIdOf(auth),
             clientId: auth?.clientId ?? 'unknown',
+            lastSeenAt: Date.now(),
           });
           this.options.logger.info('MCP session initialized', {
-            sessionId: id,
+            session: sessionTag(id),
             clientId: auth?.clientId,
             sessions: this.sessions.size,
           });
@@ -454,7 +643,7 @@ export class HttpTransportHost {
         });
         if (id) {
           this.options.logger.info('MCP session closed', {
-            sessionId: id,
+            session: sessionTag(id),
             sessions: this.sessions.size,
           });
         }
@@ -477,7 +666,7 @@ export class HttpTransportHost {
     if (!session || !this.ownsSession(session, authOf(req))) {
       if (session) {
         this.options.logger.warn('Rejected cross-grant session access', {
-          sessionId,
+          session: sessionTag(sessionId as string),
           clientId: authOf(req)?.clientId,
         });
       }
@@ -486,6 +675,7 @@ export class HttpTransportHost {
     }
 
     try {
+      session.lastSeenAt = Date.now();
       await session.transport.handleRequest(req, res);
     } catch (error) {
       this.options.logger.error('MCP session request failed', error as Error);
@@ -494,12 +684,45 @@ export class HttpTransportHost {
   }
 
   async start(): Promise<void> {
-    const { host, port, logger, publicUrl } = this.options;
+    if (this.state === 'running') return;
+    if (this.state === 'starting' && this.startPromise) return this.startPromise;
+    if (this.state === 'stopping' || this.state === 'stopped') {
+      throw new Error('HttpTransportHost has been stopped and cannot be restarted');
+    }
 
-    await new Promise<void>((resolve, reject) => {
-      this.httpServer = this.app.listen(port, host, () => resolve());
-      this.httpServer.on('error', reject);
+    const { host, port, logger, publicUrl } = this.options;
+    this.state = 'starting';
+
+    // `app.listen()` returns the server synchronously, so a concurrent stop()
+    // used to close it before 'listening' ever fired, leaving this promise
+    // pending for ever. Settling on 'close' as well is what makes stop()
+    // during start() terminate.
+    this.startPromise = new Promise<void>((resolve, reject) => {
+      const server = this.app.listen(port, host, (): void => {
+        if (this.state === 'starting') this.state = 'running';
+        resolve();
+      });
+      this.httpServer = server;
+      server.on('error', (error: Error) => {
+        if (this.state === 'starting') {
+          reject(error);
+        } else {
+          // After startup a `reject` here is a no-op, so the error would
+          // otherwise vanish entirely.
+          logger.error('HTTP server error', error);
+        }
+      });
+      server.once('close', () => {
+        if (this.state === 'starting') {
+          reject(new Error('HTTP transport was stopped before it finished starting'));
+        }
+      });
     });
+
+    await this.startPromise;
+
+    this.sessionSweeper = setInterval(() => this.sweepSessions(), SESSION_SWEEP_MS);
+    this.sessionSweeper.unref?.();
 
     logger.info('MCP HTTP transport listening', {
       bind: `${host}:${port}`,
@@ -515,23 +738,43 @@ export class HttpTransportHost {
   }
 
   async stop(): Promise<void> {
-    for (const session of this.sessions.values()) {
-      try {
-        await session.transport.close();
-      } catch {
-        /* best effort on shutdown */
-      }
-      try {
-        await session.server.close();
-      } catch {
-        /* best effort on shutdown */
-      }
+    if (this.state === 'stopped' || this.state === 'stopping') return;
+    this.state = 'stopping';
+
+    if (this.sessionSweeper) {
+      clearInterval(this.sessionSweeper);
+      this.sessionSweeper = undefined;
     }
+
+    // Settle anything sleeping on a check slot first. `httpServer.close()`
+    // waits for in-flight requests, and a submission parked on a 30 second
+    // timer is in-flight, so without this a graceful shutdown stalled for
+    // minutes and ended in a SIGKILL.
+    for (const entry of [...this.pendingConsentWaits]) entry.settle();
+    this.pendingConsentWaits.clear();
+
+    const sessions = [...this.sessions.values()];
     this.sessions.clear();
+    await Promise.all(sessions.map((session) => this.closeSession(session)));
 
     if (this.httpServer) {
-      await new Promise<void>((resolve) => this.httpServer!.close(() => resolve()));
+      const server = this.httpServer;
+      await new Promise<void>((resolve) => {
+        const deadline = setTimeout(() => {
+          // Keep-alive sockets with nothing in flight should already be gone,
+          // but a hard deadline means shutdown cannot hang on one that is not.
+          server.closeAllConnections?.();
+          resolve();
+        }, SHUTDOWN_GRACE_MS);
+        deadline.unref?.();
+        server.close(() => {
+          clearTimeout(deadline);
+          resolve();
+        });
+      });
     }
+
+    this.state = 'stopped';
   }
 
   /** Exposed for tests. */
