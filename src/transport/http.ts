@@ -242,11 +242,24 @@ export class HttpTransportHost {
       res.setHeader('Referrer-Policy', 'no-referrer');
       res.setHeader('Cache-Control', 'no-store');
       // The one HTML page has no scripts and no external assets, so this costs
-      // nothing today. `form-action 'self'` is the clause that earns its keep:
-      // it stops a future bug from retargeting the password form.
+      // nothing.
+      //
+      // Deliberately WITHOUT form-action. It was set to 'self' here, which
+      // read like free hardening and silently broke the entire authorization
+      // flow: browsers enforce form-action against the whole redirect chain,
+      // not just the form's immediate target, so the 302 carrying the
+      // authorization code to the client was blocked as a cross-origin form
+      // navigation. The server minted a valid code every time and the browser
+      // never arrived, which looks exactly like a wrong password.
+      //
+      // It cannot be fixed by listing origins either: the redirect target is
+      // whatever redirect_uri a client registered, so any allowlist wide
+      // enough to work is wide enough to be meaningless. What actually guards
+      // this flow is the destination shown on the consent page, the
+      // single-use approval and PKCE.
       res.setHeader(
         'Content-Security-Policy',
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+        "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
       );
       next();
     });

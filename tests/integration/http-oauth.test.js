@@ -525,10 +525,17 @@ async function main() {
 
     const healthz = await fetch(`${BASE}/healthz`);
     await healthz.arrayBuffer();
+    const csp = healthz.headers.get('content-security-policy') || '';
+    check('a content security policy is set', csp.includes("default-src 'none'"), csp || '(absent)');
+    // form-action must NOT be set. Browsers enforce it against the whole
+    // redirect chain, so form-action 'self' blocks the 302 that carries the
+    // authorization code to the client. The server mints a valid code and the
+    // browser never arrives, which presents exactly like a wrong password.
+    // It cost six failed authorizations and four wrong diagnoses to find.
     check(
-      'the consent page origin sets a form-action policy',
-      (healthz.headers.get('content-security-policy') || '').includes("form-action 'self'"),
-      healthz.headers.get('content-security-policy') || '(absent)',
+      'the policy does not set form-action, which would block the auth redirect',
+      !csp.includes('form-action'),
+      csp,
     );
 
     // --- method handling on /mcp -------------------------------------------
